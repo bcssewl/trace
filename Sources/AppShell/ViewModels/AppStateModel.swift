@@ -296,6 +296,23 @@ public final class AppStateModel {
             NotificationCenter.default.post(name: .traceDictationPrefsChanged, object: nil)
         }
     }
+    /// Press **Return** to finish dictation and send in one keystroke.
+    ///
+    /// While you’re dictating you’re speaking, not typing, so the Return key is
+    /// free to repurpose. When this is on, a plain Return stops the capture,
+    /// waits for the cleaned transcript to land in the focused app, then fires a
+    /// Return to submit it (e.g. send the chat message). Your dictation hotkey
+    /// still stops *without* sending, so you keep both options; Shift/⌘/Ctrl/⌥ +
+    /// Return are never hijacked, and nothing is sent if the insert was empty or
+    /// failed.
+    ///
+    /// Read once at the start of each dictation, so toggling it never rebuilds
+    /// the runtime — there’s deliberately no notification posted here.
+    public var dictationEnterSends: Bool {
+        didSet {
+            UserDefaults.standard.set(dictationEnterSends, forKey: AppStateModel.dictationEnterSendsKey)
+        }
+    }
     /// Opt-in meeting auto-detection.
     ///
     /// When `true`, the runtime arms an
@@ -929,6 +946,9 @@ public final class AppStateModel {
             UserDefaults.standard.object(forKey: AppStateModel.meetingCalendarWindowKey) as? Int ?? 15
         self.dictationShowLivePartials =
             UserDefaults.standard.object(forKey: AppStateModel.livePartialsKey) as? Bool ?? true
+        // Default ON: the requested ergonomic — Return ends dictation and sends.
+        self.dictationEnterSends =
+            UserDefaults.standard.object(forKey: AppStateModel.dictationEnterSendsKey) as? Bool ?? true
         // Default OFF: never surprise-record. Only an explicit opt-in arms the detector.
         self.meetingAutoDetectEnabled =
             UserDefaults.standard.object(forKey: AppStateModel.meetingAutoDetectKey) as? Bool ?? false
@@ -1110,6 +1130,7 @@ public final class AppStateModel {
     static let meetingCalendarWindowKey = "app.trace.meeting.calendarWindowMinutes"
     static let hotkeyKey = "app.trace.hotkeyBindings"
     static let livePartialsKey = "app.trace.dictation.showLivePartials"
+    static let dictationEnterSendsKey = "app.trace.dictation.enterSends"
     static let meetingAutoDetectKey = "app.trace.meeting.autoDetectEnabled"
     static let meetingAutoStartKey = "app.trace.meeting.autoStartOnDetect"
     static let meetingMutedAppsKey = "app.trace.meeting.mutedApps"

@@ -64,6 +64,9 @@ public final class AppRuntimeCoordinator {
     /// True while the current lone-modifier press is the one that *started*
     /// dictation — so its release can decide tap (keep recording) vs hold (stop).
     private var dictationTriggerStartedRecording = false
+    /// Active only while a dictation is recording with "Return sends" enabled:
+    /// swallows a plain Return, then stops + submits. Torn down on every stop.
+    private var enterKeyInterceptor: EnterKeyInterceptor?
     /// Press longer than this is a hold (push-to-talk); shorter is a tap (toggle).
     private static let dictationHoldThreshold: TimeInterval = 0.3
     private var bootstrapTask: Task<Void, Never>?
@@ -2085,6 +2088,7 @@ public final class AppRuntimeCoordinator {
         // the model is ready. Subsequent dictations skip this (runtime cached).
         let firstBuild = (dictationRuntime == nil)
         environment.state.activeCapture.beginDictation(sessionId: "dictation-\(Int(Date().timeIntervalSince1970))")
+        installEnterInterceptorIfEnabled()
         notchHUD?.showCompact(timer: "0:00", kind: firstBuild ? .preparing : .listening)
         Loggers.dictation.info("AppCommands.startDictation invoked (firstBuild=\(firstBuild, privacy: .public))")
         Task { [weak self] in
@@ -2098,16 +2102,14 @@ public final class AppRuntimeCoordinator {
                 Loggers.dictation.error("startDictation: speech model download failed")
                 self.notchHUD?.setKind(.downloadFailed)
                 try? await Task.sleep(nanoseconds: 2_600_000_000)
-                self.environment.state.activeCapture.end()
-                self.notchHUD?.hide()
+                self.abortDictationStartup()
                 return
             }
             guard let runtime = await self.ensureDictationRuntime() else {
                 Loggers.dictation.error("startDictation: runtime unavailable")
                 self.notchHUD?.setKind(.unavailable)
                 try? await Task.sleep(nanoseconds: 2_400_000_000)
-                self.environment.state.activeCapture.end()
-                self.notchHUD?.hide()
+                self.abortDictationStartup()
                 return
             }
             if firstBuild {
@@ -2151,7 +2153,10 @@ public final class AppRuntimeCoordinator {
         return install.parakeetReady
     }
 
-    private func runStopDictation() {
+    private func runStopDictation(submitAfterInsert: Bool = false) {
+        // Always retire the Return interceptor first: dictation is ending, and
+        // tearing it down before we post any synthetic Return rules out a loop.
+        teardownEnterInterceptor()
         environment.state.activeCapture.end()
         // Update just the label — keep the same startedAt so the elapsed
         // timer counts from when the user first hit ⌥Space instead of
@@ -2178,9 +2183,15 @@ public final class AppRuntimeCoordinator {
                     if result.cleanedText.isEmpty {
                         self.notchHUD?.setKind(.noAudio)
                     } else if !result.pasted {
+                        // Text only made it to the clipboard (no Accessibility /
+                        // AX insert) — there's nothing in the field to submit, so
+                        // never fire Return here.
                         self.notchHUD?.setKind(.copied)
                     } else {
                         self.notchHUD?.setKind(.inserted)
+                        if submitAfterInsert {
+                            await self.submitReturnAfterInsert()
+                        }
                     }
                     try? await Task.sleep(nanoseconds: 1_400_000_000)
                 }
@@ -2201,6 +2212,57 @@ public final class AppRuntimeCoordinator {
         } else {
             runStartDictation()
         }
+    }
+
+    /// Arm the "press Return to send" interceptor for this dictation, if enabled.
+    ///
+    /// The pref is read live, so flipping the Settings toggle takes effect on the
+    /// very next dictation with no runtime rebuild. When Accessibility isn't
+    /// granted the active tap can't be created — we log and leave Return alone
+    /// rather than degrading silently (the paste path owns the grant prompt).
+    private func installEnterInterceptorIfEnabled() {
+        teardownEnterInterceptor()
+        guard environment.state.dictationEnterSends else { return }
+        let interceptor = EnterKeyInterceptor { [weak self] in
+            self?.runStopDictation(submitAfterInsert: true)
+        }
+        switch interceptor.start() {
+        case .started:
+            enterKeyInterceptor = interceptor
+        case .missingPermission:
+            Loggers.dictation.info(
+                "Return-to-send: Accessibility not granted; leaving Return alone this session"
+            )
+        case .failed:
+            Loggers.dictation.error("Return-to-send: event tap creation failed")
+        }
+    }
+
+    private func teardownEnterInterceptor() {
+        enterKeyInterceptor?.stop()
+        enterKeyInterceptor = nil
+    }
+
+    /// Clean up a dictation that never got off the ground (model download failed,
+    /// runtime unavailable): retire the Return interceptor and clear the capture
+    /// chrome. These early-exit paths don't run through `runStopDictation` (which
+    /// would kick off transcription), so they own their own teardown.
+    private func abortDictationStartup() {
+        teardownEnterInterceptor()
+        environment.state.activeCapture.end()
+        notchHUD?.hide()
+    }
+
+    /// Fire a synthetic Return to submit, a beat after the transcript landed.
+    ///
+    /// Only reached when the insert genuinely succeeded with non-empty text, so
+    /// we never submit an empty or clipboard-only message. The short delay lets
+    /// the focused app finish ingesting the inserted text (enable its send
+    /// button, update its editor model) before Return arrives.
+    private func submitReturnAfterInsert() async {
+        try? await Task.sleep(nanoseconds: 70_000_000)
+        let sent = await CGEventKeySynthesizer().send(.returnKey)
+        Loggers.dictation.info("Return-to-send: submitted=\(sent, privacy: .public)")
     }
 
     private func runStartVoiceMemo() {

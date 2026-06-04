@@ -1100,10 +1100,32 @@ public struct ASREnginesSettingsView: View {
         }
     }
 
+    @ViewBuilder
+    private func returnToSendGroup(_ state: AppStateModel) -> some View {
+        SettingsGroup("Finishing") {
+            SettingsRow(
+                key: "Press Return to send",
+                hint:
+                    "While you’re dictating, tap Return to finish and send in one go — Trace drops your words into the app, then presses Return to submit (handy for chat boxes). Your dictation shortcut still stops without sending, and Shift+Return is left alone for a new line.",
+                showDivider: false
+            ) {
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { state.dictationEnterSends },
+                        set: { state.dictationEnterSends = $0 }
+                    )
+                )
+                .labelsHidden()
+            }
+        }
+    }
+
     public var body: some View {
         VStack(spacing: 0) {
             if let state {
                 liveTranscriptGroup(state)
+                returnToSendGroup(state)
                 dictationLanguageGroup(state)
             }
             tabBar

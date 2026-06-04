@@ -15,7 +15,12 @@ public protocol ClipboardStoring: Sendable {
     func readString() async -> String?
     func writeString(_ text: String) async
 }
-public enum SynthesizedKey: Sendable, Equatable { case commandV }
+public enum SynthesizedKey: Sendable, Equatable {
+    case commandV
+    /// A bare Return/Enter keypress, used to submit after a dictation insert
+    /// (the "press Return to send" ergonomic).
+    case returnKey
+}
 public protocol KeySynthesizing: Sendable {
     func send(_ key: SynthesizedKey) async -> Bool
 }
@@ -157,12 +162,21 @@ public actor PasteboardClipboard: ClipboardStoring {
 public struct CGEventKeySynthesizer: KeySynthesizing {
     public init() {}
     public func send(_ key: SynthesizedKey) async -> Bool {
-        guard key == .commandV else { return false }
         let source = CGEventSource(stateID: .combinedSessionState)
-        let down = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
-        let up = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
-        down?.flags = .maskCommand
-        up?.flags = .maskCommand
+        let virtualKey: CGKeyCode
+        let flags: CGEventFlags
+        switch key {
+        case .commandV:
+            virtualKey = 0x09  // V
+            flags = .maskCommand
+        case .returnKey:
+            virtualKey = 0x24  // Return
+            flags = []
+        }
+        let down = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: true)
+        let up = CGEvent(keyboardEventSource: source, virtualKey: virtualKey, keyDown: false)
+        down?.flags = flags
+        up?.flags = flags
         down?.post(tap: .cghidEventTap)
         up?.post(tap: .cghidEventTap)
         return down != nil && up != nil

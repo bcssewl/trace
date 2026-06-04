@@ -29,11 +29,11 @@ public struct MeetingTitleGenerator: Sendable {
         let request = LLMRequest(
             messages: [
                 LLMMessage(role: .system, content: Self.systemPrompt),
-                LLMMessage(role: .user, content: AntiInjectionGuard.wrap(Self.clip(trimmed), source: .transcript)),
+                LLMMessage(role: .user, content: AntiInjectionGuard.wrap(Self.sample(trimmed), source: .transcript)),
             ],
             taskClass: .titleGeneration,
             temperature: 0.3,
-            maxTokens: 24
+            maxTokens: 32
         )
 
         var text = ""
@@ -48,15 +48,47 @@ public struct MeetingTitleGenerator: Sendable {
     }
 
     static let systemPrompt = """
-        You write a concise, specific meeting title of 3–6 words capturing the main \
-        topic. Output only the title — no quotes, no surrounding punctuation, and no \
-        "Title:" prefix.
+        Give the meeting a clear, specific title — the kind a person writes so they \
+        recognise it later in a list. Capture what it was actually about: the main \
+        subject plus the defining topics, goals, decisions, or outcomes that gave it \
+        substance. Be specific and descriptive — a real title, not a vague category \
+        ("French lesson: past-tense practice and café role-play", not just "French \
+        lesson"). For example: "Q3 budget planning and headcount decisions", \
+        "Mobile app onboarding redesign review", "Go-to-market plan for the new pricing \
+        tier", "Pitch deck finalisation and investor follow-ups". Draw on the WHOLE \
+        conversation; ignore incidental small-talk, greetings, and tangents that were \
+        not the point. One line, roughly 4–10 words, no trailing punctuation. The \
+        transcript may be in any language or mix languages; write the title in English. \
+        Output only the title — no quotes and no "Title:" prefix.
         """
 
-    /// The opening of the transcript is enough to title from, and keeps a local
-    /// model's call cheap.
-    static func clip(_ transcript: String) -> String {
-        String(transcript.prefix(2000))
+    /// How much transcript the title model reads. Generous enough to cover a whole
+    /// meeting's worth of context while keeping the (possibly local) call bounded.
+    static let maxTranscriptChars = 16_000
+
+    /// The transcript the title model sees: the WHOLE transcript when it fits the
+    /// budget, otherwise a representative sample spanning the entire call — head,
+    /// evenly-spaced interior windows, and tail.
+    ///
+    /// Crucially this is NOT just the opening: a meeting's purpose (a lesson, a
+    /// review, a decision) usually lives in the body, while the opening is warm-up
+    /// small-talk. Titling from the opening alone is what produced "weekend chat"
+    /// titles for a class; sampling the whole span fixes that.
+    static func sample(_ transcript: String) -> String {
+        let chars = Array(transcript)
+        let total = chars.count
+        if total <= maxTranscriptChars { return transcript }
+        let windows = 8
+        let windowLen = maxTranscriptChars / windows
+        var pieces: [String] = []
+        for i in 0..<windows {
+            // Spread window starts evenly from the head (i=0) to the tail
+            // (i=windows-1), so beginning, middle, and end are all represented.
+            let start = (total - windowLen) * i / (windows - 1)
+            let end = min(start + windowLen, total)
+            pieces.append(String(chars[start..<end]))
+        }
+        return pieces.joined(separator: "\n…\n")
     }
 
     /// Whether `title` is the date-based placeholder (or empty/nil) and should be
