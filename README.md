@@ -54,12 +54,16 @@ macOS Gatekeeper stops it the first time:
 
 > "Trace" cannot be opened because the developer cannot be verified.
 
-This is expected. To run it the first time:
+This is expected. To run it the first time (macOS 15 Sequoia and later — including
+macOS 26 — removed the old right-click → Open shortcut, so this is the current
+path):
 
-1. **Right-click** (or Control-click) `Trace.app` in Applications and choose
-   **Open**, then click **Open** in the dialog. macOS remembers the choice, so you
-   only do this once.
-2. If macOS instead says the app is *"damaged and can't be opened"*, that's the
+1. Double-click Trace once; macOS refuses to open it.
+2. Open **System Settings → Privacy & Security**, scroll to the **Security**
+   section near the bottom. You'll see *"Trace was blocked to protect your Mac"*
+   with an **Open Anyway** button — click it, then confirm and authenticate with
+   your password. macOS remembers the choice, so you only do this once.
+3. If macOS instead says the app is *"damaged and can't be opened"*, that's the
    download-quarantine flag. Clear it with:
 
    ```bash
@@ -97,9 +101,21 @@ no Apple account needed — the same artifact CI publishes to Releases):
 # → dist/Trace-0.1.0.dmg
 ```
 
-For a Gatekeeper-clean, notarised release you need a paid Apple Developer
-account; that pipeline lives in [`docs/RELEASE.md`](docs/RELEASE.md) and the
-`release.yml` workflow.
+**Running it yourself, day to day?** Use the local stable-signing path instead.
+A one-time setup mints a stable self-signed certificate; every build then carries
+the *same* signature, so macOS keeps the app's Microphone / Accessibility / etc.
+permissions across rebuilds instead of re-prompting each time (ad-hoc builds get a
+fresh signature every time, which wipes permissions):
+
+```bash
+./scripts/setup-local-signing.sh        # once
+./scripts/build-local.sh --install      # build, sign stably, install to /Applications
+```
+
+This is local-only — the self-signed cert isn't trusted on other Macs, so it's not
+for distribution. For a Gatekeeper-clean, notarised release you need a paid Apple
+Developer account; that pipeline lives in [`docs/RELEASE.md`](docs/RELEASE.md) and
+the `release.yml` workflow.
 
 For day-to-day development under Xcode's debugger, see
 [`dev/README.md`](dev/README.md) (`./scripts/dev-xcode.sh`).
