@@ -44,8 +44,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Select Xcode 26
-        run: sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
+      - name: Select the latest installed Xcode
+        run: |
+          set -euo pipefail
+          LATEST="$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -vi beta | sort -V | tail -1 || true)"
+          [ -n "$LATEST" ] || LATEST=/Applications/Xcode.app
+          echo "Selecting $LATEST"
+          sudo xcode-select -s "$LATEST/Contents/Developer"
+          xcodebuild -version
+          swift --version
 
       - name: Resolve version
         id: version
