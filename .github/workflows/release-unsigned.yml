@@ -1,0 +1,99 @@
+name: release-unsigned
+
+# Free, no-Apple-account release path. On a version tag it builds an AD-HOC
+# signed .app (the minimum for the app to launch on Apple Silicon), packages an
+# UNSIGNED .dmg, and publishes it to a GitHub Release — using only the built-in
+# GITHUB_TOKEN, with no Apple Developer secrets.
+#
+# The published DMG is NOT notarized, so macOS Gatekeeper blocks it on first
+# open; the Release notes tell users to right-click → Open (see README).
+#
+# Sparkle.framework is fetched from Sparkle's own public release (no secret).
+# Its version is pinned to match the Sparkle SwiftPM dependency in
+# Package.resolved.
+#
+# When you later set up Developer ID signing + notarization, use the separate
+# `release.yml` workflow (manual dispatch) instead for a Gatekeeper-clean DMG.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Marketing version (without leading v)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  SPARKLE_VERSION: '2.9.2'
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode 26
+        run: sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
+
+      - name: Resolve version + tag
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ -n "${{ inputs.version }}" ]]; then
+              VALUE="${{ inputs.version }}"
+              TAG="v${VALUE}"
+          else
+              VALUE="${GITHUB_REF_NAME#v}"
+              TAG="${GITHUB_REF_NAME}"
+          fi
+          echo "value=$VALUE" >>"$GITHUB_OUTPUT"
+          echo "tag=$TAG"     >>"$GITHUB_OUTPUT"
+
+      - name: Fetch Sparkle framework (public release, no secret)
+        run: |
+          set -euo pipefail
+          mkdir -p Frameworks
+          URL="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          curl -fLsS "$URL" -o "$RUNNER_TEMP/sparkle.tar.xz"
+          mkdir -p "$RUNNER_TEMP/sparkle"
+          tar -xf "$RUNNER_TEMP/sparkle.tar.xz" -C "$RUNNER_TEMP/sparkle"
+          cp -R "$RUNNER_TEMP/sparkle/Sparkle.framework" Frameworks/Sparkle.framework
+
+      - name: Build unsigned DMG
+        run: ./scripts/build-app.sh --adhoc --version "${{ steps.version.outputs.value }}"
+
+      - name: Publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          DMG="$(ls dist/Trace-*.dmg)"
+          NOTES=$(cat <<'EOF'
+          Unsigned build — not notarized by Apple.
+
+          macOS will warn that the developer "cannot be verified" on first open.
+          To run it: **right-click Trace.app → Open**, then confirm. (You only
+          need to do this once.) If macOS says the app is "damaged", clear the
+          download quarantine:
+
+              xattr -dr com.apple.quarantine /Applications/Trace.app
+
+          See the README "Download" section for details.
+          EOF
+          )
+          gh release create "${{ steps.version.outputs.tag }}" "$DMG" \
+              --title "Trace ${{ steps.version.outputs.value }}" \
+              --notes "$NOTES" \
+              --verify-tag=false || \
+          gh release upload "${{ steps.version.outputs.tag }}" "$DMG" --clobber

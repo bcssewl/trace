@@ -1,0 +1,44 @@
+{
+    "schemaVersion": 1,
+    "llmRoutes": {
+        "dictationCleanup":          { "provider": "appleFM",      "model": "FoundationModels",                             "baseURL": null,                          "keychainAccount": null },
+        "titleGeneration":           { "provider": "appleFM",      "model": "FoundationModels",                             "baseURL": null,                          "keychainAccount": null },
+        "projectCategorization":     { "provider": "appleFM",      "model": "FoundationModels",                             "baseURL": null,                          "keychainAccount": null },
+        "meetingSummary":            { "provider": "openAICompat", "model": "openai/gpt-5",                                 "baseURL": "https://openrouter.ai/api/v1", "keychainAccount": "openrouter.api_key" },
+        "meetingAugmentedMerge":     { "provider": "openAICompat", "model": "openai/gpt-5",                                 "baseURL": "https://openrouter.ai/api/v1", "keychainAccount": "openrouter.api_key" },
+        "coachSmartRouting":         { "provider": "appleFM",      "model": "FoundationModels",                             "baseURL": null,                          "keychainAccount": null },
+        "coachCardContent":          { "provider": "appleFM",      "model": "FoundationModels",                             "baseURL": null,                          "keychainAccount": null },
+        "libraryQA":                 { "provider": "openAICompat", "model": "anthropic/claude-sonnet-4.6",                  "baseURL": "https://openrouter.ai/api/v1", "keychainAccount": "openrouter.api_key" },
+        "conversationStateExtractor":{ "provider": "appleFM",      "model": "FoundationModels",                             "baseURL": null,                          "keychainAccount": null }
+    },
+    "embeddingRoutes": {
+        "embeddingsIndex":  { "provider": "ollama",      "model": "nomic-embed-text", "baseURL": "http://127.0.0.1:11434", "keychainAccount": null },
+        "embeddingsLive":   { "provider": "ollama",      "model": "nomic-embed-text", "baseURL": "http://127.0.0.1:11434", "keychainAccount": null },
+        "embeddingsRerank": { "provider": "openAICompat","model": "voyage-rerank-2.5","baseURL": "https://api.voyageai.com/v1","keychainAccount": "voyageai.api_key" }
+    },
+    "hotkeys": {
+        "dictationPushToTalk": { "key": "Space",     "modifiers": ["option"],                "tripleTap": false },
+        "manualCoachTrigger":  { "key": "Control",   "modifiers": [],                        "tripleTap": true  },
+        "openMainWindow":      { "key": "S",         "modifiers": ["command", "option"],     "tripleTap": false },
+        "globalSearchQA":      { "key": "K",         "modifiers": ["command"],               "tripleTap": false }
+    },
+    "sparkle": {
+        "feedURL": "https://updates.example.com/appcast.xml",
+        "publicEDKey": "REPLACE_WITH_BASE64_PUBLIC_KEY_AT_RELEASE_TIME",
+        "enableAutomaticChecks": true,
+        "scheduledCheckIntervalSeconds": 86400
+    },
+    "storage": {
+        "markdownRoot": "~/Documents/Trace",
+        "sqlitePath": "~/Library/Application Support/Trace/index.sqlite"
+    },
+    "modelCaches": {
+        "fluidAudio": "~/Library/Application Support/Trace/FluidAudio",
+        "whisperKit": "~/Library/Application Support/Trace/WhisperKit",
+        "mlxModels":  "~/Library/Application Support/Trace/MLX"
+    },
+    "diagnostics": {
+        "logRetentionDays": 14,
+        "exportAllowed": true
+    }
+}

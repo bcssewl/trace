@@ -1,0 +1,25 @@
+Trace — App Icon Source Set
+====================================
+
+This directory holds the source PNGs that `iconutil` consumes when producing
+`AppIcon.icns`. The canonical icon files are:
+
+    icon_16x16.png
+    icon_16x16@2x.png
+    icon_32x32.png
+    icon_32x32@2x.png
+    icon_128x128.png
+    icon_128x128@2x.png
+    icon_256x256.png
+    icon_256x256@2x.png
+    icon_512x512.png
+    icon_512x512@2x.png
+
+Run `scripts/make-icns.sh` after replacing these PNGs. The script renders
+a placeholder set on-the-fly when none of the above files exist, so the
+release pipeline is unblocked even without a designed icon. Replace the
+placeholders with the real assets before any external release.
+
+The placeholder uses `sips` and `tiffutil` shipped with macOS to render
+a flat brand tile (no logo, no text, no emoji) from the AppShell visual
+identity palette declared in spec §6.5.

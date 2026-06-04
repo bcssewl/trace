@@ -1,0 +1,41 @@
+.DS_Store
+/.build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
+.netrc
+.superpowers/
+
+# Secrets & signing material — never commit (belt-and-suspenders)
+.env
+.env.*
+*.p12
+*.pem
+*.key
+*.cer
+*.mobileprovision
+*.p8
+
+# Build artifacts
+/dist/
+/Frameworks/Sparkle.framework
+
+# Local-only large assets (kept out of the repo; not part of the app)
+/my-video/
+/onboarding-prototype/
+
+# Internal design/planning notes & prototypes — kept locally, not shipped publicly
+/docs/superpowers/
+/docs/ROADMAP.md
+/coach-prototype/
+/dev/notch-preview/
+
+# XcodeGen-managed dev project (regenerated from dev/project.yml)
+dev/TraceDev.xcodeproj/
+dev/.build/
+
+# Claude agent worktrees + transient scheduler state (local, ephemeral)
+.claude/worktrees/
+.claude/scheduled_tasks.lock

@@ -1,0 +1,135 @@
+name: release
+
+# Tag-triggered or manual-dispatch release pipeline.
+#
+# Secrets the workflow expects (all encrypted in repo Settings -> Secrets):
+#   DEVELOPER_ID_P12_BASE64       Base64-encoded .p12 export of the Developer ID Application identity.
+#   DEVELOPER_ID_P12_PASSWORD     Passphrase for the .p12.
+#   KEYCHAIN_PASSWORD             Password used to create the workflow's temporary keychain.
+#   APPLE_ID                      Apple ID used for notarytool submissions.
+#   APPLE_TEAM_ID                 Ten-character team identifier.
+#   APPLE_APP_PASSWORD            App-specific password for the Apple ID.
+#   SPARKLE_ED25519_PRIVATE_KEY   Base64 EdDSA private key used by sign_update.
+#   SPARKLE_FRAMEWORK_URL         HTTPS URL to a Sparkle 2.7+ release zip.
+#
+# Outputs: signed + notarized .app, signed .dmg, and an updated appcast.xml
+# attached to the workflow run as artifacts. Uploading the artifacts to the
+# GitHub Release is intentionally left as a manual operator step so the
+# release can be inspected before going public.
+#
+# Manual-dispatch only: this requires the Apple Developer secrets below. Until
+# those are configured, the free `release-unsigned.yml` workflow handles tag
+# pushes and publishes an unsigned DMG. Switch to running THIS workflow once you
+# have Developer ID signing + notarization set up, for a Gatekeeper-clean build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Marketing version (without leading v)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Select Xcode 26
+        run: sudo xcode-select -s /Applications/Xcode_26.app/Contents/Developer
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+              echo "value=${{ inputs.version }}" >>"$GITHUB_OUTPUT"
+          else
+              echo "value=${GITHUB_REF_NAME#v}" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Create temporary keychain
+        env:
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KC="$RUNNER_TEMP/build.keychain"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          echo "KEYCHAIN_PATH=$KC" >>"$GITHUB_ENV"
+
+      - name: Import Developer ID identity
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          echo "$DEVELOPER_ID_P12_BASE64" | base64 --decode >"$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+              -k "$KEYCHAIN_PATH" \
+              -P "$DEVELOPER_ID_P12_PASSWORD" \
+              -T /usr/bin/codesign
+          security set-key-partition-list -S "apple-tool:,apple:" \
+              -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          rm "$RUNNER_TEMP/cert.p12"
+
+      - name: Store notarization credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials "trace-notary" \
+              --apple-id "$APPLE_ID" \
+              --team-id  "$APPLE_TEAM_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --keychain "$KEYCHAIN_PATH"
+
+      - name: Store Sparkle private key
+        env:
+          SPARKLE_ED25519_PRIVATE_KEY: ${{ secrets.SPARKLE_ED25519_PRIVATE_KEY }}
+        run: |
+          security add-generic-password \
+              -a "sparkle.ed25519" \
+              -s "app.trace" \
+              -w "$SPARKLE_ED25519_PRIVATE_KEY" \
+              "$KEYCHAIN_PATH"
+
+      - name: Download Sparkle framework
+        env:
+          SPARKLE_FRAMEWORK_URL: ${{ secrets.SPARKLE_FRAMEWORK_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p Frameworks
+          curl -fLsS "$SPARKLE_FRAMEWORK_URL" -o "$RUNNER_TEMP/sparkle.zip"
+          unzip -q "$RUNNER_TEMP/sparkle.zip" -d "$RUNNER_TEMP/sparkle"
+          cp -R "$RUNNER_TEMP/sparkle/Sparkle.framework" Frameworks/Sparkle.framework
+          echo "SIGN_UPDATE=$RUNNER_TEMP/sparkle/bin/sign_update" >>"$GITHUB_ENV"
+
+      - name: Run build pipeline
+        env:
+          NOTARYTOOL_PROFILE: trace-notary
+          SPARKLE_KEYCHAIN_ACCOUNT: sparkle.ed25519
+          SPARKLE_KEYCHAIN_SERVICE: app.trace
+        run: |
+          ./scripts/build-app.sh --version "${{ steps.version.outputs.value }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-${{ steps.version.outputs.value }}
+          path: |
+            dist/Trace-*.dmg
+            dist/appcast.xml
+          if-no-files-found: error

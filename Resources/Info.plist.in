@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>app.trace</string>
+    <key>CFBundleName</key>
+    <string>Trace</string>
+    <key>CFBundleDisplayName</key>
+    <string>Trace</string>
+    <key>CFBundleExecutable</key>
+    <string>Trace</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleSignature</key>
+    <string>????</string>
+    <key>CFBundleShortVersionString</key>
+    <string>@VERSION@</string>
+    <key>CFBundleVersion</key>
+    <string>@BUILD@</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>@COPYRIGHT@</string>
+
+    <!-- Permissions (TCC usage strings; see spec §12.1) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Capture your voice for dictation, voice memos, and meeting transcription.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Capture audio from other apps for meeting transcription.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Read calendar events to auto-attach meeting transcripts and add context to summaries.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>On-device speech recognition for dictation, voice memos, and meeting transcription. All speech stays on your Mac.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Used to detect the active browser tab so meeting capture can latch onto the right call.</string>
+    <key>NSUserNotificationsUsageDescription</key>
+    <string>Notify when dictation insertion fails so you can paste manually.</string>
+
+    <!-- Deep linking -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>app.trace.url</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>trace</string>
+            </array>
+        </dict>
+    </array>
+
+    <!-- Sparkle -->
+    <key>SUFeedURL</key>
+    <string>@SU_FEED_URL@</string>
+    <key>SUPublicEDKey</key>
+    <string>@SU_PUBLIC_ED_KEY@</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
+    <key>SUEnableInstallerLauncherService</key>
+    <true/>
+
+    <!-- ATS — permit localhost Ollama -->
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

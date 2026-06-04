@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Run swift-format check, swift test, and a fast plist sanity check before
+# allowing commit. Never bypass with --no-verify.
+
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+echo "==> swift format lint"
+swift format lint --recursive Sources/ Tests/ || {
+    echo "Run: swift format format --recursive Sources/ Tests/ --in-place"
+    exit 1
+}
+
+echo "==> plutil sanity check"
+if [[ -f Resources/Info.plist.in ]]; then
+    # Render with sentinel substitution so plutil can parse it (the raw template
+    # contains @VERSION@ etc., which plutil happily accepts as plain strings).
+    TMP="$(mktemp)"
+    /usr/bin/sed \
+        -e 's/@VERSION@/0.0.0-precommit/g' \
+        -e 's/@BUILD@/0/g' \
+        -e 's/@COPYRIGHT@/precommit/g' \
+        -e 's|@SU_FEED_URL@|https://precommit.invalid/appcast.xml|g' \
+        -e 's/@SU_PUBLIC_ED_KEY@/precommit/g' \
+        Resources/Info.plist.in >"$TMP"
+    /usr/bin/plutil -lint "$TMP" >/dev/null
+    rm -f "$TMP"
+fi
+if [[ -f Resources/Trace.entitlements ]]; then
+    /usr/bin/plutil -lint Resources/Trace.entitlements >/dev/null
+fi
+if [[ -f Resources/BootstrapConfig.json ]]; then
+    /usr/bin/python3 -c "import json,sys; json.load(open(sys.argv[1]))" Resources/BootstrapConfig.json
+fi
+
+echo "==> swift test"
+swift test --quiet
+
+echo "==> pre-commit OK"

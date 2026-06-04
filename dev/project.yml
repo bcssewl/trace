@@ -1,0 +1,71 @@
+name: TraceDev
+options:
+  bundleIdPrefix: app.trace
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: 0.0.0-dev
+    CURRENT_PROJECT_VERSION: 1
+    ENABLE_HARDENED_RUNTIME: YES
+    # Sign every dev build with a STABLE self-signed identity instead of ad-hoc
+    # ("-"). Ad-hoc mints a new code identity on each build, so macOS TCC treats
+    # every rebuild as a brand-new app and wipes the Accessibility / Microphone /
+    # Screen-Recording grants — that's why permissions had to be re-granted each
+    # time. The cert lives in the login keychain; signing works even though it's
+    # self-signed/untrusted (trust only affects verification, not signing).
+    # Create once if missing: Keychain Access > Certificate Assistant > Create a
+    # Certificate, name "TraceDevSigning", type "Code Signing".
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "TraceDevSigning"
+    DEVELOPMENT_TEAM: ""
+
+packages:
+  Trace:
+    path: ..
+
+targets:
+  TraceDev:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: TraceDev/TraceDevApp.swift
+      - path: TraceDev/Resources/Assets.xcassets
+        buildPhase: resources
+    dependencies:
+      - package: Trace
+        product: AppShell
+      - package: Trace
+        product: SharedCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.trace.dev
+        PRODUCT_NAME: "Trace Dev"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        INFOPLIST_FILE: TraceDev/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: TraceDev/Resources/TraceDev.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        # Pin the stable self-signed identity at the TARGET level, not just the
+        # project level — otherwise the target defaults to "Apple Development",
+        # which demands a development team/provisioning profile ("Signing for
+        # 'TraceDev' requires selecting either a development team or a provisioning
+        # profile"). Manual + this self-signed cert + an empty profile signs
+        # locally with NO team and keeps a stable code identity so TCC grants
+        # persist across rebuilds (see project-dev-stable-signing). Do NOT use
+        # Xcode's "Sign to Run Locally" — that's ad-hoc and re-mints the identity
+        # every build, wiping Mic/Accessibility/Screen-Recording grants each time.
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGN_IDENTITY: "TraceDevSigning"
+        PROVISIONING_PROFILE_SPECIFIER: ""
+        DEVELOPMENT_TEAM: ""
+    scheme:
+      testTargets: []
+      gatherCoverageData: false
+      environmentVariables:
+        OS_ACTIVITY_MODE: ""

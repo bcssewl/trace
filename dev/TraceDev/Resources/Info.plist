@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>$(EXECUTABLE_NAME)</string>
+    <key>CFBundleIdentifier</key>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Trace Dev</string>
+    <key>CFBundleDisplayName</key>
+    <string>Trace Dev</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0-dev</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+    <key>LSUIElement</key>
+    <false/>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.productivity</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticTermination</key>
+    <false/>
+    <key>NSSupportsSuddenTermination</key>
+    <false/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHumanReadableCopyright</key>
+    <string>Trace Dev build — not for distribution.</string>
+
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Trace Dev captures your voice for dictation, voice memos, and meeting transcription while developing.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>Trace Dev captures audio from other apps for meeting transcription while developing.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>Trace Dev reads calendar events to auto-attach meeting transcripts and add context to summaries.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Trace Dev detects the active browser tab so meeting capture can latch onto the right call.</string>
+    <key>NSUserNotificationsUsageDescription</key>
+    <string>Trace Dev notifies when dictation insertion fails so you can paste manually.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>Trace Dev uses Speech.framework on-device recognition as the local ASR fallback.</string>
+</dict>
+</plist>

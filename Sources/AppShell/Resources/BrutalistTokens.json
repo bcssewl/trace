@@ -1,0 +1,17 @@
+{
+  "ui": {
+    "background": "#0a0a0a",
+    "card": "#181818",
+    "tertiary": "#080808",
+    "foreground": "#e8e8e8",
+    "mutedForeground": "#7a7a7a",
+    "sidebarForeground": "#bdbdbd",
+    "secondary": "#1f1f1f",
+    "accent": "#2e2e2e",
+    "border": "#2e2e2e",
+    "sidebarBorder": "#1f1f1f",
+    "primary": "#ff3300",
+    "highlightMatch": "rgba(255, 51, 0, 0.18)",
+    "highlightActive": "rgba(255, 51, 0, 0.42)"
+  }
+}
