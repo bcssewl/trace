@@ -194,8 +194,8 @@ public struct BootstrapConfig: Sendable, Codable, Hashable {
     )
 
     private static let defaultSparkle: SparkleDefaults = .init(
-        feedURL: "https://trace.dev/appcast.xml",
-        publicEDKey: "REPLACE_WITH_BASE64_PUBLIC_KEY_AT_RELEASE_TIME",
+        feedURL: "https://github.com/bcssewl/trace/releases/latest/download/appcast.xml",
+        publicEDKey: "bOFYSnRDpIR99coVgJeQSJB8u7ofVXQzBPCOitXiOXU=",
         enableAutomaticChecks: true,
         scheduledCheckIntervalSeconds: 86_400
     )

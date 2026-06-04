@@ -107,12 +107,43 @@ jobs:
               ./scripts/build-app.sh --adhoc --version "$VERSION"
           fi
 
+      - name: Sign + generate the Sparkle appcast (in-app auto-update feed)
+        env:
+          SPARKLE_ED_PRIVATE_KEY: ${{ secrets.SPARKLE_ED_PRIVATE_KEY }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SPARKLE_ED_PRIVATE_KEY:-}" ]; then
+              echo "::warning::SPARKLE_ED_PRIVATE_KEY not set — skipping appcast; installed apps won't see this release as an update."
+              exit 0
+          fi
+          GEN="$RUNNER_TEMP/sparkle/bin/generate_appcast"
+          # Process only THIS release's DMG in an isolated dir.
+          mkdir -p dist/feed
+          cp dist/Trace-*.dmg dist/feed/
+          # generate_appcast mounts the DMG, reads the real bundle version (so
+          # Sparkle's version comparison is correct), EdDSA-signs it, and writes
+          # an appcast whose <enclosure> points at this release's download URL.
+          # The key is piped via stdin (--ed-key-file -), never written to disk.
+          printf '%s' "$SPARKLE_ED_PRIVATE_KEY" | "$GEN" \
+              --ed-key-file - \
+              --download-url-prefix "https://github.com/bcssewl/trace/releases/download/${TAG}/" \
+              --link "https://github.com/bcssewl/trace" \
+              -o dist/feed/appcast.xml \
+              dist/feed
+          echo "== generated appcast =="
+          cat dist/feed/appcast.xml
+
       - name: Publish to GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           DMG="$(ls dist/Trace-*.dmg)"
+          # Ship the signed appcast alongside the DMG so the app's "latest"
+          # feed URL resolves to it; tolerate its absence (appcast step skipped).
+          ASSETS=("$DMG")
+          [ -f dist/feed/appcast.xml ] && ASSETS+=("dist/feed/appcast.xml")
           NOTES=$(cat <<'EOF'
           Self-signed build — not notarized by Apple, so macOS Gatekeeper still
           blocks it on first open.
@@ -129,8 +160,8 @@ jobs:
           "Download" section for details.
           EOF
           )
-          gh release create "${{ steps.version.outputs.tag }}" "$DMG" \
+          gh release create "${{ steps.version.outputs.tag }}" "${ASSETS[@]}" \
               --title "Trace ${{ steps.version.outputs.value }}" \
               --notes "$NOTES" \
               --verify-tag=false || \
-          gh release upload "${{ steps.version.outputs.tag }}" "$DMG" --clobber
+          gh release upload "${{ steps.version.outputs.tag }}" "${ASSETS[@]}" --clobber

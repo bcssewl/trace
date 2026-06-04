@@ -70,8 +70,12 @@ fi
 
 echo "    rendering Info.plist"
 export COPYRIGHT="Copyright $(date +%Y) Trace authors. All rights reserved."
-export SU_FEED_URL_RESOLVED="${SU_FEED_URL:-https://trace.dev/appcast.xml}"
-export SU_PUBLIC_ED_KEY_RESOLVED="${SU_PUBLIC_ED_KEY:-REPLACE_WITH_BASE64_PUBLIC_KEY_AT_RELEASE_TIME}"
+# The update feed lives on the GitHub Releases "latest" alias, so the app always
+# checks the newest published release. The public key matches the EdDSA private
+# key held in the SPARKLE_ED_PRIVATE_KEY CI secret (override both via env if the
+# signing key is ever rotated).
+export SU_FEED_URL_RESOLVED="${SU_FEED_URL:-https://github.com/bcssewl/trace/releases/latest/download/appcast.xml}"
+export SU_PUBLIC_ED_KEY_RESOLVED="${SU_PUBLIC_ED_KEY:-bOFYSnRDpIR99coVgJeQSJB8u7ofVXQzBPCOitXiOXU=}"
 
 # Use a Python one-liner for portable substitution (sed has different
 # semantics across BSD vs GNU; Python ships with macOS by default).
