@@ -140,9 +140,13 @@ jobs:
         run: |
           set -euo pipefail
           DMG="$(ls dist/Trace-*.dmg)"
+          # Also publish a constant-named copy so the website button
+          # (/releases/latest/download/Trace.dmg) is a one-click, always-newest
+          # direct download. The versioned name stays for the appcast + archives.
+          cp "$DMG" dist/Trace.dmg
           # Ship the signed appcast alongside the DMG so the app's "latest"
           # feed URL resolves to it; tolerate its absence (appcast step skipped).
-          ASSETS=("$DMG")
+          ASSETS=("$DMG" "dist/Trace.dmg")
           [ -f dist/feed/appcast.xml ] && ASSETS+=("dist/feed/appcast.xml")
           NOTES=$(cat <<'EOF'
           Self-signed build — not notarized by Apple, so macOS Gatekeeper still
