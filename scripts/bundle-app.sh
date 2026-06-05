@@ -11,7 +11,8 @@
 #       Resources/
 #         AppIcon.icns
 #         BootstrapConfig.json
-#         SchemaV1.bundle/        (templates etc. — synthesized from SPM resource paths)
+#         Trace_AppShell.bundle/      (SwiftPM resources used by AppShell)
+#         Trace_SharedCore.bundle/    (SwiftPM resources used by SharedCore)
 #       Frameworks/
 #         Sparkle.framework/      (operator drops the release framework here)
 #       _CodeSignature/           (populated by sign-app.sh)
@@ -127,7 +128,10 @@ else
 fi
 
 echo "    copying SwiftPM resource bundles"
-# SwiftPM copies module resources next to the executable as <Module>_<Resource>.bundle.
+# Keep resource bundles in the canonical signed app resources directory.
+# AppShell/SharedCore use explicit resource-bundle locators instead of the
+# SwiftPM-generated Bundle.module accessor, whose app-bundle search path points
+# at the bundle root and crashes on machines without the local build fallback.
 BIN_DIR="$(dirname "$SOURCE_BIN")"
 shopt -s nullglob
 for bundle in "$BIN_DIR"/*.bundle; do

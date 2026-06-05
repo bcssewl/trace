@@ -11,7 +11,7 @@ public enum ModeRegistryPersistence: Sendable {
 }
 
 /// Owner of the in-memory `[UUID: Mode]` table. Loads built-ins from
-/// `Bundle.module/modes-builtin.json` on `bootstrap()` and merges any persisted
+/// bundled `modes-builtin.json` on `bootstrap()` and merges any persisted
 /// custom modes from the SQLite back-end.
 ///
 /// Built-in modes (`Mode.isBuiltIn == true`) are immutable. CRUD operations
@@ -24,7 +24,7 @@ public actor ModeRegistry {
 
     public init(persistence: ModeRegistryPersistence) {
         self.persistence = persistence
-        self.bundle = .module
+        self.bundle = SharedCoreResourceBundle.bundle
     }
 
     init(persistence: ModeRegistryPersistence, bundle: Bundle) {

@@ -125,9 +125,9 @@ public struct BrandLogoView: View {
         let name = "\(slug)-\(dark ? "dark" : "light")"
         if let cached = cache[name] { return cached }
         let url =
-            Bundle.module.url(forResource: name, withExtension: "png", subdirectory: "Resources/Logos")
-            ?? Bundle.module.url(forResource: name, withExtension: "png", subdirectory: "Logos")
-            ?? Bundle.module.url(forResource: name, withExtension: "png")
+            AppShellResourceBundle.url(forResource: name, withExtension: "png", subdirectory: "Resources/Logos")
+            ?? AppShellResourceBundle.url(forResource: name, withExtension: "png", subdirectory: "Logos")
+            ?? AppShellResourceBundle.url(forResource: name, withExtension: "png")
         let image = url.flatMap { NSImage(contentsOf: $0) }
         cache[name] = image
         return image

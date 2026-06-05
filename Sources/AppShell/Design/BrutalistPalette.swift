@@ -148,7 +148,15 @@ public struct BrutalistPalette: Sendable, Equatable {
     }
 
     public static func loadFromBundle() throws -> Pair {
-        guard let url = Bundle.module.url(forResource: "BrutalistTokens", withExtension: "json") else {
+        guard
+            let url =
+                AppShellResourceBundle.url(
+                    forResource: "BrutalistTokens",
+                    withExtension: "json",
+                    subdirectory: "Resources"
+                )
+                ?? AppShellResourceBundle.url(forResource: "BrutalistTokens", withExtension: "json")
+        else {
             throw TraceError.configInvalid(
                 field: "brutalist.tokens",
                 reason: "BrutalistTokens.json missing from bundle"

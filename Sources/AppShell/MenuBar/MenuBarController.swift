@@ -46,8 +46,9 @@ public final class MenuBarController {
     /// bundled asset can't be loaded.
     private static func menuBarImage() -> NSImage? {
         let url =
-            Bundle.module.url(forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Resources/Logos")
-            ?? Bundle.module.url(forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Logos")
+            AppShellResourceBundle.url(
+                forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Resources/Logos")
+            ?? AppShellResourceBundle.url(forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Logos")
         if let url, let image = NSImage(contentsOf: url) {
             image.size = NSSize(width: 20, height: 20)
             image.isTemplate = true
@@ -139,8 +140,9 @@ struct MenuBarPopoverContentView: View {
     /// The custom Trace mark as a tintable template image, for the popover header.
     static let traceGlyph: Image = {
         let url =
-            Bundle.module.url(forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Resources/Logos")
-            ?? Bundle.module.url(forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Logos")
+            AppShellResourceBundle.url(
+                forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Resources/Logos")
+            ?? AppShellResourceBundle.url(forResource: "TraceMenuBar", withExtension: "png", subdirectory: "Logos")
         if let url, let ns = NSImage(contentsOf: url) {
             ns.isTemplate = true
             return Image(nsImage: ns).renderingMode(.template)
