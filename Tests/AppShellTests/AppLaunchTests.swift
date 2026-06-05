@@ -57,18 +57,13 @@ final class AppLaunchTests: XCTestCase {
         try await second.database.close()
     }
 
-    func testBootReportsSparkleValidationFailuresForPlaceholderKey() async throws {
+    func testBootAcceptsBundledSparkleConfiguration() async throws {
         let dbPath = tempDir.appendingPathComponent("sparkle.sqlite")
         let launch = AppLaunch()
         let result = try await launch.boot(databasePath: dbPath)
 
-        // The bundled defaults still carry the placeholder key, so we expect
-        // a placeholder validation failure (this is what gates the operator
-        // from shipping a build without rotating the EdDSA key).
         XCTAssertTrue(
-            result.sparkleValidationFailures.contains(.publicKeyPlaceholder),
-            "expected placeholder failure, got \(result.sparkleValidationFailures)"
-        )
+            result.sparkleValidationFailures.isEmpty, "unexpected failures: \(result.sparkleValidationFailures)")
         try await result.database.close()
     }
 }
