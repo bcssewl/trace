@@ -15,7 +15,9 @@ public actor EmbeddingDetector {
         }
     }
 
-    public static let topicShiftCosineThreshold: Float = 0.55
+    /// Forwarded to `CoachThresholds.topicShiftCosine` — the single home for the
+    /// pipeline's tuning constants and their documented relationships.
+    public static let topicShiftCosineThreshold: Float = CoachThresholds.topicShiftCosine
 
     private let embedder: EmbeddingClient
     private let vectorSearch: VectorSearch

@@ -43,16 +43,20 @@ public actor BurstDecayThrottle {
         self.clock = clock
     }
 
+    /// Tier cutoffs live in `CoachThresholds` alongside the burst weights they
+    /// interact with (e.g. KB relevance alone can never reach hot) — see the
+    /// relationship notes there.
     public static func tier(forBurstScore score: Double) -> Tier {
         switch score {
-        case let s where s > 0.7: return .hot
-        case let s where s >= 0.5: return .medium
+        case let s where s > CoachThresholds.burstHotThreshold: return .hot
+        case let s where s >= CoachThresholds.burstMediumThreshold: return .medium
         default: return .cold
         }
     }
 
     public static func burstScore(questionDensity: Double, kbRelevance: Double) -> Double {
-        (questionDensity * 0.4) + (kbRelevance * 0.6)
+        (questionDensity * CoachThresholds.burstQuestionWeight)
+            + (kbRelevance * CoachThresholds.burstKbWeight)
     }
 
     public func evaluate(candidateScore: Double, userRequested: Bool = false) -> Decision {

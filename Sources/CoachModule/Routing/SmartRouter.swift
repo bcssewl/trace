@@ -63,8 +63,10 @@ public protocol SmartRouting: Sendable {
 public actor AppleFmSmartRouter: SmartRouting {
     // Raised from 0.7 (BAS-76 follow-up): only a STRONG match to a past meeting gets
     // surfaced verbatim, so a trivial coincidental match doesn't dump an old line.
-    public static let strongGroundedCosine: Float = 0.78
-    public static let synthesizableMinCosine: Float = 0.5
+    // Both forwarded to CoachThresholds — the single home for the pipeline's
+    // tuning constants and their documented relationships.
+    public static let strongGroundedCosine: Float = CoachThresholds.strongGroundedCosine
+    public static let synthesizableMinCosine: Float = CoachThresholds.synthesizableMinCosine
 
     private let router: ModelRouter
 

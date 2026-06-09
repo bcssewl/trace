@@ -105,6 +105,19 @@ public struct SettingsRootView: View {
         }
         .background(palette.background.color)
         .frame(minWidth: 960, minHeight: 600)
+        // Deep-link support ("Open Settings → AI models" on a notice banner):
+        // consume the one-shot pending tab whether this view mounts after the
+        // request (onAppear) or is already on screen (onReceive).
+        .onAppear { applyPendingTab() }
+        .onReceive(NotificationCenter.default.publisher(for: .traceOpenSettingsTab)) { _ in
+            applyPendingTab()
+        }
+    }
+
+    private func applyPendingTab() {
+        guard let appState, let tab = appState.pendingSettingsTab else { return }
+        selectedTab = tab
+        appState.pendingSettingsTab = nil
     }
 }
 

@@ -8,6 +8,9 @@ import Foundation
 public actor CaptureStateMachine {
     public private(set) var state: CaptureState
     private var observers: [@Sendable (CaptureState) -> Void] = []
+    /// Continuations suspended in `waitForQuiescence(timeout:)`, resumed when
+    /// the machine settles (terminal or idle).
+    private var quiescenceWaiters: [UUID: CheckedContinuation<CaptureState?, Never>] = [:]
 
     public init(initial: CaptureState = .idle) {
         self.state = initial
@@ -28,6 +31,39 @@ public actor CaptureStateMachine {
         )
         for observer in observers {
             observer(next)
+        }
+        if next.isTerminal || next == .idle {
+            let waiters = quiescenceWaiters
+            quiescenceWaiters.removeAll()
+            for (_, waiter) in waiters {
+                waiter.resume(returning: next)
+            }
+        }
+    }
+
+    /// Suspends until the machine settles — reaches a terminal state or `idle`
+    /// — and returns that state, or returns immediately if already settled.
+    /// Returns `nil` when `timeout` elapses first.
+    ///
+    /// Event-driven (no polling): `transition(to:)` resumes the waiters the
+    /// instant the cycle completes, which is what lets a queued `startCapture`
+    /// chain onto the previous cycle's tail with zero added latency.
+    public func waitForQuiescence(timeout: Duration) async -> CaptureState? {
+        if state.isTerminal || state == .idle { return state }
+        let id = UUID()
+        let timeoutTask = Task { [weak self] in
+            try? await Task.sleep(for: timeout)
+            await self?.expireWaiter(id: id)
+        }
+        defer { timeoutTask.cancel() }
+        return await withCheckedContinuation { continuation in
+            quiescenceWaiters[id] = continuation
+        }
+    }
+
+    private func expireWaiter(id: UUID) {
+        if let waiter = quiescenceWaiters.removeValue(forKey: id) {
+            waiter.resume(returning: nil)
         }
     }
 

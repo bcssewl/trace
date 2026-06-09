@@ -12,6 +12,10 @@ public final class AppEnvironment {
     /// an approved download survives the user leaving the onboarding wizard and
     /// the dictation runtime can wait on the same instance.
     public let asrInstall: AsrModelInstallCoordinator
+    /// User-visible failure/notice queue, rendered as banners in the main
+    /// window. The coordinator posts here wherever it previously swallowed an
+    /// error into the log — the enforcement point of the no-silent-failure rule.
+    public let notices = AppNoticeCenter()
 
     public init(
         paths: DatabasePaths = DatabasePaths(),
@@ -31,5 +35,16 @@ public final class AppEnvironment {
         }
         self.state = state ?? AppStateModel(onboardingComplete: AppStateModel.persistedOnboardingComplete())
         self.asrInstall = AsrModelInstallCoordinator()
+        // Honour a deferred engine take-over: if onboarding's practice step had
+        // to fall back to Apple Speech while Parakeet was still downloading, it
+        // promised Parakeet would take over once the download lands. The flip
+        // below is what keeps that promise — and an explicit engine choice in
+        // Settings clears the flag, so it can never override the user.
+        self.asrInstall.onParakeetReady = { [state = self.state] in
+            guard state.parakeetTakeoverPending else { return }
+            state.parakeetTakeoverPending = false
+            state.dictationASREngine = .parakeet
+            Loggers.bootstrap.info("Parakeet finished downloading — taking over dictation as promised at onboarding")
+        }
     }
 }

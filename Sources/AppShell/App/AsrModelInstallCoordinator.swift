@@ -36,7 +36,17 @@ public final class AsrModelInstallCoordinator {
     ///
     /// This is the
     /// single gate the dictation runtime consults.
-    public private(set) var parakeetReady: Bool = false
+    public private(set) var parakeetReady: Bool = false {
+        didSet { if parakeetReady && !oldValue { onParakeetReady?() } }
+    }
+
+    /// Fired (on the main actor) the moment `parakeetReady` flips on — whether
+    /// via a disk probe or a finishing download. `AppEnvironment` uses it to
+    /// honour a deferred engine take-over: when the onboarding practice had to
+    /// run on Apple Speech because Parakeet was still downloading, it promises
+    /// the user Parakeet takes over once the download lands — this is the hook
+    /// that keeps that promise.
+    public var onParakeetReady: (@MainActor () -> Void)?
 
     /// The models this coordinator installs (essential dictation/meeting set).
     public let specs: [AsrModelSpec]

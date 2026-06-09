@@ -35,12 +35,30 @@ public final class MicCapture: @unchecked Sendable {
     private let isRunning = SyncBool(initial: false)
     private let inputDeviceName = SyncString(initial: "")
 
+    // `engine`, `configChangeObserver` and `rateTracker` are mutated ONLY on
+    // `control`'s queue (start/stop/teardown/rebuild bodies). That single
+    // serial context is what makes the drift rebuild — previously fired from
+    // the Core Audio IO thread via an unstructured Task with no exclusion —
+    // safe against a concurrent stop()/teardown() using the same engine.
     private var engine: AVAudioEngine?
     private let voiceProcessingFlag = SyncBool(initial: false)
     private var configChangeObserver: NSObjectProtocol?
     private var rateTracker: SampleRateTracker
     private let framesObservedLock = OSAllocatedUnfairLock(initialState: Int64(0))
     private let secondsObservedLock = OSAllocatedUnfairLock(initialState: TimeInterval(0))
+
+    /// Serialises start/stop/teardown/rebuild; coalesces drift-rebuild storms
+    /// (every tap callback during a drift can request one).
+    private let control = SerialRebuildCoordinator(label: "app.trace.audio.mic.control")
+
+    private let onHealthEventBox = OSAllocatedUnfairLock<(@Sendable (CaptureHealthEvent) -> Void)?>(
+        initialState: nil)
+
+    /// Observe capture health: drift/config-change rebuilds and rebuild
+    /// failures. `.rebuildFailed` means the mic is no longer capturing.
+    public func setOnHealthEvent(_ closure: @escaping @Sendable (CaptureHealthEvent) -> Void) {
+        onHealthEventBox.withLock { $0 = closure }
+    }
 
     /// Pending delayed full-teardown.
     ///
@@ -101,57 +119,62 @@ public final class MicCapture: @unchecked Sendable {
     }
 
     public func start() throws {
-        guard isRunning.compareAndSwap(expected: false, desired: true) else { return }
-        cancelIdleTeardown()
-        // Measure start latency + which path we took, so "is it actually faster?"
-        // has a hard number in the console: COLD = engine built from scratch, WARM
-        // = already-built engine just resumed (BAS-78). Watch two back-to-back
-        // dictations: the first logs cold (~hundreds of ms), the next warm (~single
-        // digits) — that gap is the dropped-first-words lag we removed.
-        let startClock = DispatchTime.now()
-        let wasWarm = engine != nil
-        do {
-            // Build the engine once and keep it WARM across cycles (BAS-78): the
-            // first dictation (or one after a long idle) pays the build cost; every
-            // one after just resumes the already-built engine — no cold-start lag
-            // clipping your opening words. `eng.start()` turns the mic on (orange
-            // dot); between cycles the engine is stopped (no dot) but stays ready.
-            if engine == nil { try buildEngine() }
-            guard let eng = engine else {
+        try control.withExclusiveControl {
+            guard isRunning.compareAndSwap(expected: false, desired: true) else { return }
+            cancelIdleTeardown()
+            // Measure start latency + which path we took, so "is it actually faster?"
+            // has a hard number in the console: COLD = engine built from scratch, WARM
+            // = already-built engine just resumed (BAS-78). Watch two back-to-back
+            // dictations: the first logs cold (~hundreds of ms), the next warm (~single
+            // digits) — that gap is the dropped-first-words lag we removed.
+            let startClock = DispatchTime.now()
+            let wasWarm = engine != nil
+            do {
+                // Build the engine once and keep it WARM across cycles (BAS-78): the
+                // first dictation (or one after a long idle) pays the build cost; every
+                // one after just resumes the already-built engine — no cold-start lag
+                // clipping your opening words. `eng.start()` turns the mic on (orange
+                // dot); between cycles the engine is stopped (no dot) but stays ready.
+                if engine == nil { try buildEngineOnQueue() }
+                guard let eng = engine else {
+                    isRunning.value = false
+                    return
+                }
+                if !eng.isRunning {
+                    eng.prepare()
+                    try eng.start()
+                }
+                let ms = Int(
+                    (Double(DispatchTime.now().uptimeNanoseconds &- startClock.uptimeNanoseconds) / 1_000_000)
+                        .rounded())
+                Loggers.audio.info(
+                    "MicCapture capturing (\(wasWarm ? "warm" : "cold", privacy: .public) start, \(ms, privacy: .public)ms)"
+                )
+            } catch {
                 isRunning.value = false
-                return
+                teardownOnQueue()
+                if case .denied = AudioPermissions.currentMicStatus() {
+                    throw TraceError.permissionDenied(kind: .microphone)
+                }
+                throw error
             }
-            if !eng.isRunning {
-                eng.prepare()
-                try eng.start()
-            }
-            let ms = Int(
-                (Double(DispatchTime.now().uptimeNanoseconds &- startClock.uptimeNanoseconds) / 1_000_000).rounded())
-            Loggers.audio.info(
-                "MicCapture capturing (\(wasWarm ? "warm" : "cold", privacy: .public) start, \(ms, privacy: .public)ms)"
-            )
-        } catch {
-            isRunning.value = false
-            teardown()
-            if case .denied = AudioPermissions.currentMicStatus() {
-                throw TraceError.permissionDenied(kind: .microphone)
-            }
-            throw error
         }
     }
 
     public func stop() {
-        guard isRunning.compareAndSwap(expected: true, desired: false) else { return }
-        // Don't tear down — just stop the audio flow (mic off, orange dot off) and
-        // keep the engine WARM so the NEXT dictation starts instantly (BAS-78). A
-        // delayed teardown releases the mic hardware if no capture resumes within
-        // the idle window, so we never hold the device forever.
-        engine?.stop()
-        Loggers.audio.info("MicCapture idle (warm; releases in \(Int(Self.idleTeardownSeconds))s if unused)")
-        scheduleIdleTeardown()
-        // NOTE: per-subscriber + `buffers` continuations are intentionally NOT
-        // finished here — they must survive across start/stop so re-using the mic
-        // delivers samples on the next cycle. Finalized only in deinit/teardown.
+        control.withExclusiveControl {
+            guard isRunning.compareAndSwap(expected: true, desired: false) else { return }
+            // Don't tear down — just stop the audio flow (mic off, orange dot off) and
+            // keep the engine WARM so the NEXT dictation starts instantly (BAS-78). A
+            // delayed teardown releases the mic hardware if no capture resumes within
+            // the idle window, so we never hold the device forever.
+            engine?.stop()
+            Loggers.audio.info("MicCapture idle (warm; releases in \(Int(Self.idleTeardownSeconds))s if unused)")
+            scheduleIdleTeardown()
+            // NOTE: per-subscriber + `buffers` continuations are intentionally NOT
+            // finished here — they must survive across start/stop so re-using the mic
+            // delivers samples on the next cycle. Finalized only in deinit/teardown.
+        }
     }
 
     /// Schedule the full teardown after the idle window.
@@ -182,6 +205,13 @@ public final class MicCapture: @unchecked Sendable {
     ///
     /// Run by the idle timer (after the warm window) or by `deinit`.
     public func teardown() {
+        control.withExclusiveControl {
+            teardownOnQueue()
+        }
+    }
+
+    /// Control-queue only.
+    private func teardownOnQueue() {
         cancelIdleTeardown()
         isRunning.value = false
         if let obs = configChangeObserver {
@@ -197,13 +227,16 @@ public final class MicCapture: @unchecked Sendable {
     }
 
     public func diagnostics() -> Diagnostics {
-        Diagnostics(
-            isRunning: isRunning.value,
-            inputDeviceName: inputDeviceName.value,
-            declaredSampleRate: rateTracker.declaredRate,
-            framesObserved: framesObservedLock.withLock { $0 },
-            secondsObserved: secondsObservedLock.withLock { $0 },
-            voiceProcessingEnabled: voiceProcessingFlag.value)
+        // Reads `rateTracker` (control-queue protected), so take the queue.
+        control.withExclusiveControl {
+            Diagnostics(
+                isRunning: isRunning.value,
+                inputDeviceName: inputDeviceName.value,
+                declaredSampleRate: rateTracker.declaredRate,
+                framesObserved: framesObservedLock.withLock { $0 },
+                secondsObserved: secondsObservedLock.withLock { $0 },
+                voiceProcessingEnabled: voiceProcessingFlag.value)
+        }
     }
 
     /// Builds + prepares the engine and installs the tap, but does NOT start
@@ -211,7 +244,8 @@ public final class MicCapture: @unchecked Sendable {
     ///
     /// Keeping a built-but-stopped engine warm
     /// between cycles is what makes the next dictation instant (BAS-78).
-    private func buildEngine() throws {
+    /// Control-queue only.
+    private func buildEngineOnQueue() throws {
         let eng = AVAudioEngine()
         let input = eng.inputNode
 
@@ -253,7 +287,12 @@ public final class MicCapture: @unchecked Sendable {
                 Loggers.audio.warning(
                     "MicCapture rate drift: declared=\(declaredRate, privacy: .public) measured=\(measured, privacy: .public). Rebuilding engine."
                 )
-                Task { [weak self] in self?.rebuildAfterDrift() }
+                // Serialised + coalesced: a drift storm (every callback fires
+                // this until the rebuild lands) collapses into one rebuild
+                // instead of racing the engine teardown from the IO thread.
+                self?.requestRebuild(
+                    reason: "sample-rate drift",
+                    trigger: .driftTriggeredRebuild(declaredHz: declaredRate, measuredHz: measured))
                 return
             }
 
@@ -288,21 +327,40 @@ public final class MicCapture: @unchecked Sendable {
             NotificationCenter.default.removeObserver(obs)
             configChangeObserver = nil
         }
-        installConfigChangeObserver()
+        installConfigChangeObserverOnQueue()
     }
 
-    private func installConfigChangeObserver() {
+    /// Control-queue only.
+    private func installConfigChangeObserverOnQueue() {
         configChangeObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange,
             object: engine,
             queue: nil
         ) { [weak self] _ in
             Loggers.audio.info("AVAudioEngineConfigurationChange observed; rebuilding MicCapture")
-            Task { [weak self] in self?.rebuildAfterDrift() }
+            self?.requestRebuild(
+                reason: "engine configuration change",
+                trigger: .configurationChangeTriggeredRebuild)
         }
     }
 
-    private func rebuildAfterDrift() {
+    /// Request an engine rebuild. Serialised on the control queue; overlapping
+    /// requests coalesce to at most one trailing rebuild. Safe from any thread
+    /// including the audio IO tap (it never blocks on the rebuild itself).
+    internal func requestRebuild(reason: String, trigger: CaptureHealthEvent? = nil) {
+        let scheduled = control.requestRebuild { [weak self] in
+            self?.performRebuildOnQueue()
+        }
+        if scheduled, let trigger {
+            emitHealth(trigger)
+        } else if !scheduled {
+            Loggers.audio.info(
+                "MicCapture rebuild request coalesced (\(reason, privacy: .public))")
+        }
+    }
+
+    /// Control-queue only — invoked solely via `control.requestRebuild`.
+    private func performRebuildOnQueue() {
         guard isRunning.value else { return }
         if let eng = engine {
             eng.inputNode.removeTap(onBus: 0)
@@ -310,15 +368,24 @@ public final class MicCapture: @unchecked Sendable {
         }
         engine = nil
         do {
-            try buildEngine()
+            try buildEngineOnQueue()
             engine?.prepare()
             try engine?.start()
+            emitHealth(.rebuildSucceeded)
+            Loggers.audio.info("MicCapture rebuilt; capture resumed")
         } catch {
             Loggers.audio.error(
                 "MicCapture rebuild failed: \(error.localizedDescription, privacy: .public)")
             isRunning.value = false
             buffersContinuation.finish()
+            // Loud failure: the mic is dead. The health event lets the runtime
+            // tell the user instead of recording silence.
+            emitHealth(.rebuildFailed(reason: error.localizedDescription))
         }
+    }
+
+    private func emitHealth(_ event: CaptureHealthEvent) {
+        (onHealthEventBox.withLock { $0 })?(event)
     }
 
     private static func fetchCurrentInputDeviceName() throws -> String {

@@ -30,11 +30,21 @@ public final class EnterKeyInterceptor {
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
     private let onReturn: @MainActor () -> Void
+    /// Which bare keypresses this tap swallows (Return/Enter by default; the
+    /// Escape variant uses kVK_Escape).
+    private let interceptKeyCodes: Set<Int64>
 
     /// - Parameter onReturn: invoked (on the main actor, out-of-band from the
     ///   tap callback) when a plain Return is intercepted.
     public init(onReturn: @escaping @MainActor () -> Void) {
         self.onReturn = onReturn
+        self.interceptKeyCodes = Self.returnKeyCodes
+    }
+
+    /// Same machinery, different key — used by `EscapeKeyInterceptor`.
+    init(keyCodes: Set<Int64>, onIntercept: @escaping @MainActor () -> Void) {
+        self.onReturn = onIntercept
+        self.interceptKeyCodes = keyCodes
     }
 
     @discardableResult
@@ -99,7 +109,7 @@ public final class EnterKeyInterceptor {
 
         case .keyDown:
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            guard Self.returnKeyCodes.contains(keyCode) else {
+            guard interceptKeyCodes.contains(keyCode) else {
                 return Unmanaged.passUnretained(event)
             }
             // Only a *bare* Return submits. Let Shift/⌘/Ctrl/⌥ + Return through
@@ -129,5 +139,37 @@ public final class EnterKeyInterceptor {
         default:
             return Unmanaged.passUnretained(event)
         }
+    }
+}
+
+/// Esc-to-cancel for dictation: a short-lived active tap that swallows a
+/// *bare* Escape keypress while a dictation is recording and reports it, so
+/// the caller can cancel the capture (discard audio + spool) without the
+/// Escape also reaching the focused app — where it could close a dialog or
+/// exit a text field the user was dictating into.
+///
+/// Same mechanics, trust requirements, and bare-key-only semantics as
+/// `EnterKeyInterceptor` (it shares the implementation); alive only while
+/// dictation records. The tap disarms itself after one interception.
+@MainActor
+public final class EscapeKeyInterceptor {
+    /// kVK_Escape.
+    private static let escapeKeyCode: Int64 = 53
+
+    private let inner: EnterKeyInterceptor
+
+    /// - Parameter onEscape: invoked (on the main actor, out-of-band from the
+    ///   tap callback) when a plain Escape is intercepted.
+    public init(onEscape: @escaping @MainActor () -> Void) {
+        self.inner = EnterKeyInterceptor(keyCodes: [Self.escapeKeyCode], onIntercept: onEscape)
+    }
+
+    @discardableResult
+    public func start() -> EnterKeyInterceptor.StartResult {
+        inner.start()
+    }
+
+    public func stop() {
+        inner.stop()
     }
 }

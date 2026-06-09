@@ -20,6 +20,12 @@ public enum AppSchema {
             SchemaV22.migration,  // meeting_index_state (BAS-28)
             SchemaV29.migration,  // files (BAS-22)
             SchemaV30.migration,  // project overrides (BAS-23)
+            SchemaV31.migration,  // fts_reconcile_state (storage batch)
+            SchemaV32.migration,  // files.recovery_attempts (storage batch)
+            // v33 is deliberately unused — the storage batch reserved v31–v33 and
+            // shipped two; the dictation batch owns v34–v35. `apply` gap-fills, so
+            // a future v33 can still slot in cleanly. Next free versions: v33, v35+.
+            DictationSchemaV34.migration,  // dictations.recovered (crash recovery)
         ]
 
     public static func bootstrap(database: SqliteDatabase) async throws {

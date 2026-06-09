@@ -5,6 +5,16 @@ import MeetingModule
 import SharedCore
 @preconcurrency import Speech
 
+extension Notification.Name {
+    /// Posted (on any thread) when the dictation crash-recovery spool can't be
+    /// created or written — recordings are temporarily NOT crash-protected.
+    /// The coordinator turns this into a coalesced user-visible warning; the
+    /// dictation itself deliberately continues in memory (refusing to record
+    /// because the insurance file failed would be the worse harm).
+    public static let traceDictationCrashProtectionLost = Notification.Name(
+        "app.trace.dictation.crashProtectionLost")
+}
+
 @MainActor
 public final class LiveDictationRuntime {
     public let controller: DictationController
@@ -50,9 +60,23 @@ public final class LiveDictationRuntime {
         let streamer =
             showLivePartials
             ? ASREngineRegistry.makeStreamingTranscriber(for: asrEngine, cloudProvider: cloudProvider) : nil
+        // Crash-durability spool: every capture's 16 kHz audio is appended to
+        // disk as it arrives and deleted once the transcript is safely out, so
+        // a crash mid-dictation can be recovered instead of losing the take.
+        let spoolDirectory: URL?
+        do {
+            spoolDirectory = try DictationSpoolStore.defaultDirectory()
+        } catch {
+            spoolDirectory = nil
+            Loggers.dictation.error(
+                "dictation crash-spool directory unavailable — recordings will not be crash-durable: \(String(describing: error), privacy: .public)"
+            )
+            NotificationCenter.default.post(name: .traceDictationCrashProtectionLost, object: nil)
+        }
         let asr = BatchedASR(
-            backend: backend, mic: mic, streamer: streamer, locale: transcriptionLanguage.locale, onPartial: onPartial,
-            onLevel: onLevel)
+            backend: backend, subscribeAudio: { mic.subscribe() }, streamer: streamer,
+            locale: transcriptionLanguage.locale, spoolDirectory: spoolDirectory,
+            onPartial: onPartial, onLevel: onLevel)
         try await asr.prepareBackend()
         Loggers.dictation.info(
             "Dictation ASR engine: \(asrEngine.rawValue, privacy: .public) streaming=\(streamer != nil, privacy: .public)"
@@ -98,6 +122,35 @@ public final class LiveDictationRuntime {
         self.voiceMemo = memo
         self.asrAdapter = asr
         self.controller = DictationController(dependencies: deps)
+    }
+
+    // MARK: - Crash recovery (orphaned dictation spools)
+
+    /// Spools left behind by a crashed/force-quit session, newest first.
+    ///
+    /// Pure filesystem scan — callable before (or without) any runtime being
+    /// built, e.g. at app launch to surface "a dictation from a previous
+    /// session can be recovered".
+    public nonisolated static func orphanedDictationSpools() -> [OrphanedDictationSpool] {
+        guard let directory = try? DictationSpoolStore.defaultDirectory() else { return [] }
+        return DictationSpoolStore.orphanedSpools(in: directory)
+    }
+
+    /// Recovers one orphaned spool: transcribes its audio through this
+    /// runtime's batch ASR backend, saves the text to dictation history
+    /// flagged `recovered`, copies it to the clipboard, and deletes the spool.
+    public func recoverDictationSpool(_ orphan: OrphanedDictationSpool) async throws -> DictationRecord {
+        let directory = try DictationSpoolStore.defaultDirectory()
+        let recovery = DictationSpoolRecovery(directory: directory, historyStore: historyStore)
+        let asr = asrAdapter
+        return try await recovery.recover(orphan) { samples in
+            try await asr.transcribeBatch(samples)
+        }
+    }
+
+    /// Deletes an orphaned spool the user chose not to recover.
+    public nonisolated static func discardDictationSpool(_ orphan: OrphanedDictationSpool) {
+        DictationSpoolStore.discard(orphan)
     }
 }
 
@@ -181,13 +234,31 @@ public enum DictationASREngine: String, Sendable, Hashable, Codable, CaseIterabl
     public var isCloud: Bool { self == .cloud }
 }
 
-final class BatchedASR: PipelineASR, @unchecked Sendable {
+/// Actor-isolated capture/transcription adapter between the mic and the
+/// dictation controller.
+///
+/// Actor isolation is the data-race fix: `collectedSamples`, `consumeTask`,
+/// `streamingActive`, and the crash-recovery spool used to be plain fields
+/// mutated both by the consume task and by `beginCycle()`/`finishCycle()` with
+/// no synchronisation. Now every mutation happens on the actor, and cycle
+/// boundaries are made deterministic two ways:
+///
+/// - `finishCycle()` cancels the consume task and AWAITS its completion, so it
+///   observes every sample of its own cycle and the task can't append after
+///   the snapshot;
+/// - each cycle carries a generation token; a stale task (cancelled but still
+///   unwinding) that calls back in with an old generation is ignored, so it
+///   can never pollute the next cycle's buffer.
+actor BatchedASR: PipelineASR {
     private let backend: any TranscriptionBackend
-    private let mic: MicCapture
+    /// Fresh per-cycle mic stream factory (`MicCapture.subscribe` in
+    /// production; hand-driven streams in tests).
+    private let subscribeAudio: @Sendable () -> AsyncStream<AVAudioPCMBuffer>
     /// Live streaming transcriber for this engine, or nil if it's batch-only.
     ///
     /// When present and it starts successfully, its transcript IS the result —
-    /// we skip the batch pass and the 16 kHz sample buffering entirely.
+    /// we skip the batch pass (the 16 kHz samples are still spooled to disk
+    /// for crash recovery).
     private let streamer: (any StreamingTranscriber)?
     /// Called off-main with each interim transcript while streaming.
     private let onPartial: (@Sendable (String) -> Void)?
@@ -195,25 +266,38 @@ final class BatchedASR: PipelineASR, @unchecked Sendable {
     private let onLevel: (@Sendable (Double) -> Void)?
     /// The language to decode (BAS-74) — `.autoDetect` lets Whisper detect it.
     private let locale: Locale
+    /// Where crash-recovery spools are written; nil disables spooling.
+    private let spoolDirectory: URL?
+
     private var collectedSamples: [Float] = []
     private var consumeTask: Task<Void, Never>?
     private var streamingActive = false
+    /// Cycle generation — bumped by `beginCycle`/`cancelCycle` so a stale
+    /// consume task's late appends are ignored.
+    private var generation: UInt64 = 0
+    /// Crash-durability spool for the in-flight cycle (see
+    /// `DictationAudioSpool`). Deleted on clean completion or cancel; kept on
+    /// disk when transcription fails or the process dies.
+    private var spool: DictationAudioSpool?
+    private var spoolWriteFailureLogged = false
 
     /// Batch engines expect 16 kHz mono Float32.
     private static let targetSampleRate: Double = 16_000
 
     init(
         backend: any TranscriptionBackend,
-        mic: MicCapture,
+        subscribeAudio: @escaping @Sendable () -> AsyncStream<AVAudioPCMBuffer>,
         streamer: (any StreamingTranscriber)? = nil,
         locale: Locale = .current,
+        spoolDirectory: URL? = nil,
         onPartial: (@Sendable (String) -> Void)? = nil,
         onLevel: (@Sendable (Double) -> Void)? = nil
     ) {
         self.backend = backend
-        self.mic = mic
+        self.subscribeAudio = subscribeAudio
         self.streamer = streamer
         self.locale = locale
+        self.spoolDirectory = spoolDirectory
         self.onPartial = onPartial
         self.onLevel = onLevel
     }
@@ -231,47 +315,55 @@ final class BatchedASR: PipelineASR, @unchecked Sendable {
     }
 
     func beginCycle() async throws {
-        // Cancel any consume task a prior cycle left running. The happy path nils
-        // this in finishCycle, but a cycle aborted via the controller's cancel()
-        // (e.g. runOneCycle timing out) never calls finishCycle — without this the
-        // orphaned task keeps its mic subscription and would append to
-        // collectedSamples concurrently with the new cycle's task (doubled audio +
-        // a data race on the non-isolated buffer).
-        consumeTask?.cancel()
-        consumeTask = nil
+        // Retire any consume task a prior cycle left running and WAIT for it —
+        // a merely-cancelled task could still be mid-append. After this await
+        // no stale append can interleave with the new cycle's state.
+        await retireConsumeTask()
+        generation &+= 1
+        let gen = generation
         collectedSamples.removeAll(keepingCapacity: true)
         streamingActive = false
+        // A leftover spool here means the previous cycle was abandoned without
+        // finish/cancel — in-process, so the audio was deliberately dropped.
+        spool?.discard()
+        spool = nil
+        openSpool()
 
         // Model-adaptive capture. If the engine provides a streaming transcriber
         // and it starts, feed it the mic and use its transcript as the result —
-        // no batch pass, no sample buffering. Otherwise buffer 16 kHz samples for
-        // a one-shot batch transcription on stop.
+        // no batch pass. Either way the 16 kHz samples are appended to the
+        // crash-recovery spool as they arrive.
         if let streamer, let onPartial, await streamer.start(onPartial: onPartial) {
             streamingActive = true
-            let stream = mic.subscribe()
-            consumeTask = Task { [weak self] in
-                for await buffer in stream {
-                    guard let self else { return }
-                    self.onLevel?(Self.vuLevel(ASRAudioConvert.mono16kFloat(buffer)))
-                    self.streamer?.append(buffer)
-                }
-            }
-        } else {
-            let stream = mic.subscribe()
-            consumeTask = Task { [weak self] in
+            let stream = subscribeAudio()
+            consumeTask = Task { [weak self, streamer, onLevel = self.onLevel] in
                 for await buffer in stream {
                     guard let self else { return }
                     let samples = ASRAudioConvert.mono16kFloat(buffer)
-                    self.onLevel?(Self.vuLevel(samples))
-                    self.collectedSamples.append(contentsOf: samples)
+                    onLevel?(Self.vuLevel(samples))
+                    streamer.append(buffer)
+                    await self.spoolOnly(samples, generation: gen)
+                }
+            }
+        } else {
+            let stream = subscribeAudio()
+            consumeTask = Task { [weak self, onLevel = self.onLevel] in
+                for await buffer in stream {
+                    guard let self else { return }
+                    let samples = ASRAudioConvert.mono16kFloat(buffer)
+                    onLevel?(Self.vuLevel(samples))
+                    await self.ingest(samples, generation: gen)
                 }
             }
         }
     }
 
     func finishCycle() async throws -> String {
-        consumeTask?.cancel()
-        consumeTask = nil
+        // Grace period FIRST so in-flight buffers drain into the consumer (the
+        // controller already stopped the mic), THEN deterministically retire
+        // the task. The old order — cancel, then sleep — threw the tail away.
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        await retireConsumeTask()
         onLevel?(0)  // drop the notch VU meter when capture stops (BAS-79)
 
         // Streaming engine: the live transcriber already produced the transcript;
@@ -281,6 +373,7 @@ final class BatchedASR: PipelineASR, @unchecked Sendable {
             streamingActive = false
             let streamed = await streamer.finish()
             collectedSamples.removeAll(keepingCapacity: true)
+            closeSpoolClean()
             Loggers.dictation.info(
                 "BatchedASR finishCycle (streaming) transcript len=\(streamed.count, privacy: .public)"
             )
@@ -288,17 +381,119 @@ final class BatchedASR: PipelineASR, @unchecked Sendable {
         }
 
         // Batch engine: no live transcript — transcribe the whole captured
-        // buffer in one pass. Brief grace period first to let any in-flight
-        // buffers drain into our subscriber.
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        // buffer in one pass.
         let samples = collectedSamples
         collectedSamples.removeAll(keepingCapacity: true)
         let rms = Self.rms(samples)
         Loggers.dictation.info(
             "BatchedASR finishCycle (batch) samples=\(samples.count, privacy: .public) duration=\(Double(samples.count) / Self.targetSampleRate, privacy: .public)s rms=\(rms, privacy: .public)"
         )
-        guard !samples.isEmpty else { return "" }
-        return try await backend.transcribe(samples, locale: locale, previousContext: nil)
+        guard !samples.isEmpty else {
+            closeSpoolClean()
+            return ""
+        }
+        do {
+            let text = try await backend.transcribe(samples, locale: locale, previousContext: nil)
+            // Transcript safely extracted — the spool has served its purpose.
+            closeSpoolClean()
+            return text
+        } catch {
+            // Transcription failed AFTER capture: keep the audio on disk so the
+            // recording is recoverable instead of gone.
+            spool?.keepForRecovery()
+            spool = nil
+            Loggers.dictation.error(
+                "BatchedASR transcription failed — audio kept for recovery: \(String(describing: error), privacy: .public)"
+            )
+            throw error
+        }
+    }
+
+    /// Abandon the in-flight cycle: the user cancelled, so drop the buffered
+    /// samples, retire the consumer, and DELETE the spool (a deliberate cancel
+    /// is not a crash — nothing to recover).
+    func cancelCycle() async {
+        await retireConsumeTask()
+        generation &+= 1
+        onLevel?(0)
+        if streamingActive, let streamer {
+            streamingActive = false
+            _ = await streamer.finish()
+        }
+        collectedSamples.removeAll(keepingCapacity: true)
+        spool?.discard()
+        spool = nil
+    }
+
+    /// One-shot batch transcription outside a capture cycle — the
+    /// crash-recovery path runs orphaned spool audio through this.
+    func transcribeBatch(_ samples: [Float]) async throws -> String {
+        try await backend.transcribe(samples, locale: locale, previousContext: nil)
+    }
+
+    // MARK: - consume-task plumbing
+
+    /// Appends a chunk to the cycle buffer + spool — actor-isolated, and
+    /// generation-guarded so a stale task can't pollute the next cycle.
+    private func ingest(_ samples: [Float], generation gen: UInt64) {
+        guard gen == generation else { return }
+        collectedSamples.append(contentsOf: samples)
+        appendToSpool(samples)
+    }
+
+    /// Spool-only append for the streaming path (the live transcriber owns the
+    /// transcript; the disk copy is purely crash insurance).
+    private func spoolOnly(_ samples: [Float], generation gen: UInt64) {
+        guard gen == generation else { return }
+        appendToSpool(samples)
+    }
+
+    /// Cancels the consume task and awaits its completion, so no append can
+    /// land after this returns. Suspending here releases the actor, letting
+    /// the task's final in-flight `ingest` calls run before it unwinds.
+    private func retireConsumeTask() async {
+        guard let task = consumeTask else { return }
+        consumeTask = nil
+        task.cancel()
+        await task.value
+    }
+
+    // MARK: - spool plumbing
+
+    private func openSpool() {
+        guard let spoolDirectory else { return }
+        spoolWriteFailureLogged = false
+        do {
+            spool = try DictationAudioSpool(directory: spoolDirectory)
+        } catch {
+            spool = nil
+            // Loud, but the dictation itself continues in memory — refusing to
+            // record because the insurance file failed would be the worse harm.
+            Loggers.dictation.error(
+                "dictation crash-spool unavailable for this cycle: \(String(describing: error), privacy: .public)"
+            )
+            NotificationCenter.default.post(name: .traceDictationCrashProtectionLost, object: nil)
+        }
+    }
+
+    private func appendToSpool(_ samples: [Float]) {
+        guard let spool else { return }
+        do {
+            try spool.append(samples)
+        } catch {
+            if !spoolWriteFailureLogged {
+                spoolWriteFailureLogged = true
+                Loggers.dictation.error(
+                    "dictation crash-spool write failed — disk copy stops here, capture continues: \(String(describing: error), privacy: .public)"
+                )
+                NotificationCenter.default.post(name: .traceDictationCrashProtectionLost, object: nil)
+            }
+        }
+    }
+
+    private func closeSpoolClean() {
+        spool?.finishClean()
+        spool = nil
     }
 
     private static func rms(_ samples: [Float]) -> Float {

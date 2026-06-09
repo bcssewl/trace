@@ -79,7 +79,12 @@ public actor SessionRepository {
     /// ordering cheap). Optionally scoped to one project.
     /// Meetings not filed into any project — the triage Inbox queue. Most-recent
     /// first; assigning a meeting to a project removes it from this list.
-    public func listInboxMeetings(limit: Int = 500) async throws -> [SessionMetadata] {
+    ///
+    /// `limit` defaults to unbounded: these are metadata-only rows (a few hundred
+    /// bytes each), and the old default of 500 made meetings beyond it silently
+    /// vanish from the library. Use ``listMeetingsPage(projectId:inboxOnly:after:limit:)``
+    /// for incremental loading.
+    public func listInboxMeetings(limit: Int = Int.max) async throws -> [SessionMetadata] {
         let sql = """
             SELECT id, project_id, title, started_at, ended_at, session_dir_path
             FROM meetings WHERE project_id IS NULL ORDER BY started_at DESC LIMIT ?
@@ -88,23 +93,17 @@ public actor SessionRepository {
             try stmt.bind(int: limit, at: 1)
             var out: [SessionMetadata] = []
             while try stmt.step() == .row {
-                guard let id = stmt.columnText(at: 0), let dir = stmt.columnText(at: 5) else { continue }
-                let endedRaw = stmt.columnInt64(at: 4)
-                out.append(
-                    SessionMetadata(
-                        sessionId: id,
-                        projectId: stmt.columnText(at: 1),
-                        title: stmt.columnText(at: 2),
-                        startedAt: Date(timeIntervalSince1970: TimeInterval(stmt.columnInt64(at: 3))),
-                        endedAt: endedRaw == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(endedRaw)),
-                        sessionDirPath: dir
-                    ))
+                if let meta = Self.decodeMetadataRow(stmt) { out.append(meta) }
             }
             return out
         }
     }
 
-    public func listMeetings(projectId: String? = nil, limit: Int = 500) async throws -> [SessionMetadata] {
+    /// All meetings (optionally one project's), most-recent first.
+    ///
+    /// `limit`
+    /// defaults to unbounded — see ``listInboxMeetings(limit:)`` for why.
+    public func listMeetings(projectId: String? = nil, limit: Int = Int.max) async throws -> [SessionMetadata] {
         let base = "SELECT id, project_id, title, started_at, ended_at, session_dir_path FROM meetings"
         let sql =
             projectId == nil
@@ -119,20 +118,110 @@ public actor SessionRepository {
             }
             var out: [SessionMetadata] = []
             while try stmt.step() == .row {
-                guard let id = stmt.columnText(at: 0), let dir = stmt.columnText(at: 5) else { continue }
-                let endedRaw = stmt.columnInt64(at: 4)
-                out.append(
-                    SessionMetadata(
-                        sessionId: id,
-                        projectId: stmt.columnText(at: 1),
-                        title: stmt.columnText(at: 2),
-                        startedAt: Date(timeIntervalSince1970: TimeInterval(stmt.columnInt64(at: 3))),
-                        endedAt: endedRaw == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(endedRaw)),
-                        sessionDirPath: dir
-                    ))
+                if let meta = Self.decodeMetadataRow(stmt) { out.append(meta) }
             }
             return out
         }
+    }
+
+    // MARK: Keyset pagination
+
+    /// Opaque "everything strictly after this row" position for
+    /// ``listMeetingsPage(projectId:inboxOnly:after:limit:)``.
+    ///
+    /// Keyset (started_at, id) rather than OFFSET, so a page boundary stays
+    /// stable while rows are inserted or deleted between fetches.
+    public struct MeetingPageCursor: Sendable, Hashable {
+        public let startedAt: Date
+        public let sessionId: String
+        public init(startedAt: Date, sessionId: String) {
+            self.startedAt = startedAt
+            self.sessionId = sessionId
+        }
+    }
+
+    /// One page of meetings plus the cursor for the next page (nil = no more).
+    public struct MeetingPage: Sendable {
+        public let items: [SessionMetadata]
+        public let nextCursor: MeetingPageCursor?
+        public var hasMore: Bool { nextCursor != nil }
+        public init(items: [SessionMetadata], nextCursor: MeetingPageCursor?) {
+            self.items = items
+            self.nextCursor = nextCursor
+        }
+    }
+
+    /// Paginated meeting list (most-recent first), the incremental-loading
+    /// counterpart of ``listMeetings(projectId:limit:)`` /
+    /// ``listInboxMeetings(limit:)``.
+    ///
+    /// Pass `after: page.nextCursor` to fetch
+    /// the next page; `inboxOnly` scopes to uncategorised meetings (and ignores
+    /// `projectId`).
+    public func listMeetingsPage(
+        projectId: String? = nil,
+        inboxOnly: Bool = false,
+        after cursor: MeetingPageCursor? = nil,
+        limit: Int = 100
+    ) async throws -> MeetingPage {
+        var conditions: [String] = []
+        if inboxOnly {
+            conditions.append("project_id IS NULL")
+        } else if projectId != nil {
+            conditions.append("project_id = ?")
+        }
+        if cursor != nil {
+            conditions.append("(started_at < ? OR (started_at = ? AND id < ?))")
+        }
+        let whereClause = conditions.isEmpty ? "" : "WHERE " + conditions.joined(separator: " AND ")
+        let sql = """
+            SELECT id, project_id, title, started_at, ended_at, session_dir_path
+              FROM meetings \(whereClause)
+             ORDER BY started_at DESC, id DESC LIMIT ?
+            """
+        let fetchLimit = max(1, limit)
+        let rows = try await database.withStatement(sql: sql) { stmt -> [SessionMetadata] in
+            var idx: Int32 = 1
+            if !inboxOnly, let projectId {
+                try stmt.bind(text: projectId, at: idx)
+                idx += 1
+            }
+            if let cursor {
+                let epoch = Int64(cursor.startedAt.timeIntervalSince1970)
+                try stmt.bind(int64: epoch, at: idx)
+                try stmt.bind(int64: epoch, at: idx + 1)
+                try stmt.bind(text: cursor.sessionId, at: idx + 2)
+                idx += 3
+            }
+            // Fetch one extra row to learn whether a further page exists.
+            try stmt.bind(int: fetchLimit + 1, at: idx)
+            var out: [SessionMetadata] = []
+            while try stmt.step() == .row {
+                if let meta = Self.decodeMetadataRow(stmt) { out.append(meta) }
+            }
+            return out
+        }
+        let hasMore = rows.count > fetchLimit
+        let items = hasMore ? Array(rows.prefix(fetchLimit)) : rows
+        let next = hasMore
+            ? items.last.map { MeetingPageCursor(startedAt: $0.startedAt, sessionId: $0.sessionId) }
+            : nil
+        return MeetingPage(items: items, nextCursor: next)
+    }
+
+    /// Decode the shared `id, project_id, title, started_at, ended_at,
+    /// session_dir_path` column shape used by every meeting list query.
+    private static func decodeMetadataRow(_ stmt: SqliteStatement) -> SessionMetadata? {
+        guard let id = stmt.columnText(at: 0), let dir = stmt.columnText(at: 5) else { return nil }
+        let endedRaw = stmt.columnInt64(at: 4)
+        return SessionMetadata(
+            sessionId: id,
+            projectId: stmt.columnText(at: 1),
+            title: stmt.columnText(at: 2),
+            startedAt: Date(timeIntervalSince1970: TimeInterval(stmt.columnInt64(at: 3))),
+            endedAt: endedRaw == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(endedRaw)),
+            sessionDirPath: dir
+        )
     }
 
     /// Load one finalized meeting's content (notes + summary + transcript) from
@@ -151,15 +240,28 @@ public actor SessionRepository {
         )
     }
 
+    /// The canonical transcript file for a session directory: the finalized
+    /// JSONL when present, else the live stream, else nil.
+    ///
+    /// Shared with
+    /// `StorageReconciler`, which verifies the FTS index against this file.
+    static func canonicalTranscriptURL(in dir: URL) -> URL? {
+        let finalURL = dir.appendingPathComponent("transcript.final.jsonl")
+        if FileManager.default.fileExists(atPath: finalURL.path) { return finalURL }
+        let liveURL = dir.appendingPathComponent("transcript.live.jsonl")
+        if FileManager.default.fileExists(atPath: liveURL.path) { return liveURL }
+        return nil
+    }
+
     /// Parse a session's transcript JSONL (final if present, else the live
     /// stream) into utterances.
     ///
     /// Tolerant: unparseable lines are skipped.
-    private static func loadTranscript(in dir: URL) -> [Utterance] {
-        let finalURL = dir.appendingPathComponent("transcript.final.jsonl")
-        let liveURL = dir.appendingPathComponent("transcript.live.jsonl")
-        let url = FileManager.default.fileExists(atPath: finalURL.path) ? finalURL : liveURL
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
+    /// Enriched lines (extra JSON keys) decode fine — unknown keys are ignored.
+    static func loadTranscript(in dir: URL) -> [Utterance] {
+        guard let url = canonicalTranscriptURL(in: dir),
+            let text = try? String(contentsOf: url, encoding: .utf8)
+        else { return [] }
         let decoder = JSONDecoder()
         var out: [Utterance] = []
         for line in text.split(separator: "\n") {
@@ -303,19 +405,40 @@ public actor SessionRepository {
         try await fts.upsertNotes(meetingId: sessionId, text: markdownText)
     }
 
-    /// Permanently delete a meeting: its session directory on disk plus its
-    /// `meetings` row and transcript/notes FTS rows.
+    /// Permanently delete a meeting: its session directory on disk plus every
+    /// database trace — the `meetings` row, transcript/notes FTS rows, vector
+    /// index rows (`kb_chunks` / `kb_embeddings`, which used to be left behind
+    /// and ghosted in semantic search), and its index-state bookkeeping.
     ///
-    /// Irreversible.
+    /// All
+    /// database rows go in one transaction so a crash mid-delete can't leave a
+    /// half-deleted meeting. Irreversible.
     public func deleteMeeting(sessionId: String) async throws {
-        if let path = try? await sessionDirPath(sessionId: sessionId) {
-            try? FileManager.default.removeItem(atPath: path)
+        // Remove the on-disk content FIRST and throw on failure: deleting the
+        // DB rows while the audio/transcript files silently survive would tell
+        // the user a (possibly sensitive) meeting is gone when it isn't. A
+        // failed file removal leaves the meeting fully intact for a retry.
+        if let path = try? await sessionDirPath(sessionId: sessionId),
+            FileManager.default.fileExists(atPath: path)
+        {
+            try FileManager.default.removeItem(atPath: path)
         }
-        try await fts.deleteTranscript(meetingId: sessionId)
-        try await fts.deleteNotes(meetingId: sessionId)
-        try await database.withStatement(sql: "DELETE FROM meetings WHERE id = ?") { stmt in
-            try stmt.bind(text: sessionId, at: 1)
-            _ = try stmt.step()
+        try await database.transaction {
+            try await fts.deleteTranscript(meetingId: sessionId)
+            try await fts.deleteNotes(meetingId: sessionId)
+            let cleanupSQL = [
+                "DELETE FROM kb_embeddings WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE meeting_id = ?)",
+                "DELETE FROM kb_chunks WHERE meeting_id = ?",
+                "DELETE FROM meeting_index_state WHERE meeting_id = ?",
+                "DELETE FROM fts_reconcile_state WHERE meeting_id = ?",
+                "DELETE FROM meetings WHERE id = ?",
+            ]
+            for sql in cleanupSQL {
+                try await database.withStatement(sql: sql) { stmt in
+                    try stmt.bind(text: sessionId, at: 1)
+                    _ = try stmt.step()
+                }
+            }
         }
         Loggers.storage.info("Deleted session \(sessionId, privacy: .public)")
     }

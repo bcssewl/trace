@@ -23,11 +23,17 @@ if [[ -z "$VERSION" ]]; then
     exit 1
 fi
 
-# Accept "0.1.2" or "v0.1.2"; normalise to a leading "v".
+# Accept "0.1.2" or "v0.1.2"; normalise to a leading "v". A pre-release
+# suffix (v0.1.2-beta.1) is allowed: CI marks it as a GitHub pre-release, so
+# releases/latest (the Stable update channel) skips it, while the rolling
+# beta-feed release (the Beta update channel) picks it up.
 [[ "$VERSION" == v* ]] || VERSION="v$VERSION"
-if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "ERROR: version must look like v1.2.3 (got '$VERSION')" >&2
+if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+    echo "ERROR: version must look like v1.2.3 or v1.2.3-beta.1 (got '$VERSION')" >&2
     exit 1
+fi
+if [[ "$VERSION" == *-* ]]; then
+    echo "==> pre-release tag: will publish to the Beta update channel only"
 fi
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

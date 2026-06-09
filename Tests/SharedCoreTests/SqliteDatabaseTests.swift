@@ -244,4 +244,109 @@ final class SqliteDatabaseActorTests: XCTestCase {
         try await db.close()
         try await db.close()
     }
+
+    // MARK: Durability
+
+    func testSynchronousIsFull() async throws {
+        let url = tempDir.appendingPathComponent("sync.sqlite")
+        let db = try await SqliteDatabase.open(at: url)
+        // PRAGMA synchronous reports 2 for FULL.
+        let mode = try await db.scalarInt(sql: "PRAGMA synchronous")
+        XCTAssertEqual(mode, 2, "primary content deserves synchronous=FULL")
+        try await db.close()
+    }
+
+    // MARK: Transaction re-entrancy
+
+    func testNestedTransactionCommitsEverything() async throws {
+        let url = tempDir.appendingPathComponent("g.sqlite")
+        let db = try await SqliteDatabase.open(at: url)
+        try await db.exec(sql: "CREATE TABLE t (n INTEGER)")
+
+        try await db.transaction {
+            try await db.exec(sql: "INSERT INTO t (n) VALUES (1)")
+            // Nested call from the same task: must flatten onto a SAVEPOINT,
+            // not issue a second BEGIN (which would error and roll back both).
+            try await db.transaction {
+                try await db.exec(sql: "INSERT INTO t (n) VALUES (2)")
+            }
+            try await db.exec(sql: "INSERT INTO t (n) VALUES (3)")
+        }
+        let count = try await db.scalarInt(sql: "SELECT COUNT(*) FROM t")
+        XCTAssertEqual(count, 3)
+        try await db.close()
+    }
+
+    func testNestedTransactionRollsBackOnlyItsOwnWork() async throws {
+        let url = tempDir.appendingPathComponent("h.sqlite")
+        let db = try await SqliteDatabase.open(at: url)
+        try await db.exec(sql: "CREATE TABLE t (n INTEGER)")
+        struct InnerBoom: Error {}
+
+        try await db.transaction {
+            try await db.exec(sql: "INSERT INTO t (n) VALUES (1)")
+            do {
+                try await db.transaction {
+                    try await db.exec(sql: "INSERT INTO t (n) VALUES (2)")
+                    throw InnerBoom()
+                }
+                XCTFail("inner should have thrown")
+            } catch is InnerBoom {
+                // expected: the inner SAVEPOINT rolled back, outer continues
+            }
+            try await db.exec(sql: "INSERT INTO t (n) VALUES (3)")
+        }
+        let values = try await db.withStatement(sql: "SELECT n FROM t ORDER BY n") { stmt -> [Int] in
+            var out: [Int] = []
+            while try stmt.step() == .row { out.append(stmt.columnInt(at: 0)) }
+            return out
+        }
+        XCTAssertEqual(values, [1, 3], "inner insert must be rolled back, outer ones kept")
+        try await db.close()
+    }
+
+    func testOuterRollbackDiscardsCommittedNestedWork() async throws {
+        let url = tempDir.appendingPathComponent("i.sqlite")
+        let db = try await SqliteDatabase.open(at: url)
+        try await db.exec(sql: "CREATE TABLE t (n INTEGER)")
+        struct OuterBoom: Error {}
+
+        do {
+            try await db.transaction {
+                try await db.transaction {
+                    try await db.exec(sql: "INSERT INTO t (n) VALUES (1)")
+                }
+                throw OuterBoom()
+            }
+            XCTFail("outer should have thrown")
+        } catch is OuterBoom {}
+        let count = try await db.scalarInt(sql: "SELECT COUNT(*) FROM t")
+        XCTAssertEqual(count, 0, "a 'committed' savepoint inside a rolled-back outer transaction must vanish")
+        try await db.close()
+    }
+
+    func testConcurrentTransactionsFromSeparateTasksSerialize() async throws {
+        let url = tempDir.appendingPathComponent("j.sqlite")
+        let db = try await SqliteDatabase.open(at: url)
+        try await db.exec(sql: "CREATE TABLE t (n INTEGER)")
+
+        // Each transaction body suspends mid-flight, giving the other task every
+        // chance to interleave. With the old implementation the second BEGIN
+        // fired inside the first transaction and corrupted both; now the second
+        // transaction queues until the first commits.
+        await withTaskGroup(of: Void.self) { group in
+            for i in 0..<4 {
+                group.addTask {
+                    try? await db.transaction {
+                        try await db.exec(sql: "INSERT INTO t (n) VALUES (\(i))")
+                        try? await Task.sleep(for: .milliseconds(10))
+                        try await db.exec(sql: "INSERT INTO t (n) VALUES (\(i + 100))")
+                    }
+                }
+            }
+        }
+        let count = try await db.scalarInt(sql: "SELECT COUNT(*) FROM t")
+        XCTAssertEqual(count, 8, "all four transactions must commit, none may corrupt another")
+        try await db.close()
+    }
 }

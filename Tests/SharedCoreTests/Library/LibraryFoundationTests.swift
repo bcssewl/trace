@@ -162,6 +162,28 @@ final class KbCacheTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    /// Prune integrity: chunk + embedding deletes are transactional, so a prune
+    /// can never leave orphaned embedding rows (or chunk rows without vectors).
+    func testPruneObsoleteLeavesNoOrphanRows() async throws {
+        let keep = chunk("keep.md", "sha-keep")
+        let drop1 = chunk("drop1.md", "sha-d1")
+        let drop2 = chunk("drop2.md", "sha-d2")
+        for c in [keep, drop1, drop2] {
+            try await cache.upsert(chunk: c, embedding: emb(c, [1, 0, 0]), config: cfg)
+        }
+
+        try await cache.pruneObsolete(keeping: [(file: "keep.md", sha: "sha-keep")])
+
+        let keptChunks = try await db.scalarInt(sql: "SELECT COUNT(*) FROM kb_chunks")
+        XCTAssertEqual(keptChunks, 1)
+        let orphanEmbeddings = try await db.scalarInt(
+            sql: "SELECT COUNT(*) FROM kb_embeddings WHERE chunk_id NOT IN (SELECT id FROM kb_chunks)")
+        XCTAssertEqual(orphanEmbeddings, 0)
+        let chunksWithoutVectors = try await db.scalarInt(
+            sql: "SELECT COUNT(*) FROM kb_chunks WHERE id NOT IN (SELECT chunk_id FROM kb_embeddings)")
+        XCTAssertEqual(chunksWithoutVectors, 0)
+    }
+
     func testLoadValidReturnsMatchingConfigOnly() async throws {
         let c = chunk("a.md", "abc")
         try await cache.upsert(chunk: c, embedding: emb(c, [1, 0, 0]), config: cfg)

@@ -225,10 +225,15 @@ struct FileBatchListView: View {
                 memoPlaybackBar(record)
             }
             if status == .failed, let reason = record.errorReason {
+                // The whole reason matters (it names the failed stage and, for
+                // crash-recovery abandonment, what to do next) — keep it
+                // readable and hoverable rather than clipped to two lines.
                 Text(reason)
                     .font(BrutalistTypography.caption)
-                    .foregroundStyle(palette.fgMuted.color)
-                    .lineLimit(2)
+                    .foregroundStyle(BrutalistPalette.semantic(scheme).warning.color)
+                    .lineLimit(4)
+                    .help(reason)
+                    .textSelection(.enabled)
             }
         }
         .padding(.horizontal, 14)

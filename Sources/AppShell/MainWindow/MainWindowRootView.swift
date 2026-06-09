@@ -123,6 +123,8 @@ public struct MainWindowRootView: View {
     }()
     @Bindable var captureState: ActiveCaptureModel
     @Bindable var appState: AppStateModel
+    /// Failure/notice queue rendered as banners over the window content.
+    let notices: AppNoticeCenter
 
     private let inspectorMinWidth: CGFloat = 240
     private let inspectorMaxWidth: CGFloat = 640
@@ -130,11 +132,13 @@ public struct MainWindowRootView: View {
     public init(
         projectStore: ProjectStore? = nil,
         captureState: ActiveCaptureModel = ActiveCaptureModel(),
-        appState: AppStateModel = AppStateModel()
+        appState: AppStateModel = AppStateModel(),
+        notices: AppNoticeCenter = AppNoticeCenter()
     ) {
         _projectsModel = State(initialValue: ProjectsViewModel(store: projectStore))
         self.captureState = captureState
         self.appState = appState
+        self.notices = notices
     }
 
     private var isMeeting: Bool { captureState.mode == .meeting }
@@ -154,6 +158,18 @@ public struct MainWindowRootView: View {
         }
         .frame(minWidth: BrutalistMetrics.mainWindowMinSize.width, minHeight: BrutalistMetrics.mainWindowMinSize.height)
         .background(palette.background.color)
+        // Failure/notice banners float over whatever is showing — including the
+        // Settings takeover — so a recovery button is never hidden by context.
+        .overlay(alignment: .topTrailing) {
+            NoticeBannerStack(center: notices, appState: appState)
+        }
+        // A notice's "Open Settings → …" button: flip to the in-window Settings
+        // takeover; the target tab waits in `appState.pendingSettingsTab`.
+        .onReceive(NotificationCenter.default.publisher(for: .traceOpenSettingsTab)) { _ in
+            if selection != .settings {
+                withAnimation(.easeOut(duration: 0.18)) { selection = .settings }
+            }
+        }
         .task { await projectsModel.refresh() }
         // Remember the last non-settings location (so Back returns there) and keep
         // the active project context in sync with the current selection.

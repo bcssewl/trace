@@ -40,7 +40,9 @@ final class DictationHistoryStoreTests: XCTestCase {
         )
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         db = try await SqliteDatabase.open(at: tempDir.appendingPathComponent("idx.sqlite"))
-        try await SchemaV1.bootstrap(database: db)
+        // Full production schema: `delete(id:)` purges the entry_fts row in the
+        // same transaction, so the keyword-search table must exist here too.
+        try await AppSchema.bootstrap(database: db)
     }
 
     override func tearDown() async throws {
@@ -165,5 +167,50 @@ final class DictationHistoryStoreTests: XCTestCase {
         let back = try await store.record(id: failed.id)
         XCTAssertNotNil(back)
         XCTAssertFalse(back?.inserted ?? true)
+    }
+
+    func testRecoveredFlagRoundTrips() async throws {
+        let store = DictationHistoryStore(database: db)
+        let recovered = DictationRecord(
+            id: "dictation_recovered_1",
+            projectID: nil,
+            modeName: "Recovered",
+            bundleID: nil,
+            rawText: "salvaged from a crash",
+            cleanedText: "salvaged from a crash",
+            inserted: false,
+            durationMs: 9_000,
+            startedAt: 2_000,
+            recovered: true
+        )
+        try await store.insert(recovered)
+        let back = try await store.record(id: recovered.id)
+        XCTAssertEqual(back?.recovered, true)
+
+        let normal = DictationRecord(
+            id: "dictation_normal_1",
+            projectID: nil,
+            modeName: "Default",
+            bundleID: nil,
+            rawText: "live take",
+            cleanedText: "Live take.",
+            inserted: true,
+            durationMs: 1_000,
+            startedAt: 3_000
+        )
+        try await store.insert(normal)
+        let backNormal = try await store.record(id: normal.id)
+        XCTAssertEqual(backNormal?.recovered, false)
+    }
+
+    func testDecodeToleratesJSONWithoutRecoveredField() throws {
+        // JSON persisted before the v34 `recovered` field existed.
+        let legacy = """
+            {"id":"dictation_legacy","projectID":null,"modeName":"Default",
+             "bundleID":null,"rawText":"r","cleanedText":"c","inserted":true,
+             "durationMs":10,"startedAt":1}
+            """
+        let record = try JSONDecoder().decode(DictationRecord.self, from: Data(legacy.utf8))
+        XCTAssertFalse(record.recovered)
     }
 }

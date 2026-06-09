@@ -118,12 +118,13 @@ public struct Mode: Sendable, Codable, Hashable, Identifiable {
         )
     }
 
-    /// Compiles `bundleIDRegex` lazily.
+    /// Compiles `bundleIDRegex`, served from the process-wide
+    /// `ModeRegexCache` so repeated resolutions don't recompile per press.
     ///
     /// Throws `TraceError.configInvalid` if the pattern fails to compile.
     public func compiledBundleIDRegex() throws -> NSRegularExpression {
         do {
-            return try NSRegularExpression(pattern: bundleIDRegex, options: [])
+            return try ModeRegexCache.compiled(bundleIDRegex)
         } catch {
             throw TraceError.configInvalid(
                 field: "Mode.bundleIDRegex",
@@ -132,14 +133,14 @@ public struct Mode: Sendable, Codable, Hashable, Identifiable {
         }
     }
 
-    /// Compiles `urlRegex` (case-insensitive), or returns `nil` when the mode is
-    /// not website-scoped.
+    /// Compiles `urlRegex` (case-insensitive, cached), or returns `nil` when
+    /// the mode is not website-scoped.
     ///
     /// Throws `TraceError.configInvalid` on a bad pattern.
     public func compiledURLRegex() throws -> NSRegularExpression? {
         guard let urlRegex, !urlRegex.isEmpty else { return nil }
         do {
-            return try NSRegularExpression(pattern: urlRegex, options: [.caseInsensitive])
+            return try ModeRegexCache.compiled(urlRegex, options: [.caseInsensitive])
         } catch {
             throw TraceError.configInvalid(
                 field: "Mode.urlRegex",

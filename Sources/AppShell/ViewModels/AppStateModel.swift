@@ -81,6 +81,12 @@ public final class AppStateModel {
     public var onboardingComplete: Bool
     public var coachOverlayVisible: Bool
     public var notchHudVisible: Bool
+    /// One-shot deep-link target for the Settings UI, set just before posting
+    /// `traceOpenSettingsTab` (e.g. by a notice banner's "Open Settings → …"
+    /// button). The settings view consumes and clears it on appearance, so it
+    /// works whether Settings is already open or mounts in response to the
+    /// post. Transient — never persisted.
+    public var pendingSettingsTab: SettingsTab?
     public var appearancePreference: AppearancePreference {
         didSet {
             UserDefaults.standard.set(appearancePreference.rawValue, forKey: AppStateModel.appearanceKey)
@@ -97,6 +103,19 @@ public final class AppStateModel {
             // Invalidate the cached dictation runtime so the new engine takes
             // effect on the next capture instead of after an app restart.
             NotificationCenter.default.post(name: .traceDictationPrefsChanged, object: nil)
+        }
+    }
+    /// Set when onboarding's practice step had to fall back to Apple Speech
+    /// because the chosen Parakeet model was still downloading — with the
+    /// on-screen promise that Parakeet takes over the moment it lands.
+    ///
+    /// Persisted so the promise survives a relaunch (the AppDelegate resumes
+    /// the download at boot while this is set). Cleared when the take-over
+    /// fires, or when the user explicitly picks an engine in Settings — an
+    /// explicit choice always outranks the deferred one.
+    public var parakeetTakeoverPending: Bool {
+        didSet {
+            UserDefaults.standard.set(parakeetTakeoverPending, forKey: AppStateModel.parakeetTakeoverPendingKey)
         }
     }
     /// The specific on-device model (an `ASRModelCatalog` id, e.g. `whisper-small`
@@ -655,7 +674,9 @@ public final class AppStateModel {
     ///
     /// When on, starting a
     /// meeting presents the screen-share-invisible coach panel and runs the
-    /// detection pipeline. Default on; per-mode config lives in Coach settings.
+    /// detection pipeline. Default OFF — the Coach is a heavy, model-driven
+    /// beta feature, so it stays dormant until explicitly enabled in Coach
+    /// settings. Per-mode config lives there too.
     public var coachEnabled: Bool {
         didSet {
             UserDefaults.standard.set(coachEnabled, forKey: AppStateModel.coachEnabledKey)
@@ -781,10 +802,15 @@ public final class AppStateModel {
     }
     /// Update channel label ("Stable" / "Beta").
     ///
-    /// Persisted; the channel→feed-URL
-    /// switch is tracked as a follow-up.
+    /// Persisted; writing posts `traceUpdaterPrefsChanged` so the AppDelegate
+    /// re-resolves the Sparkle feed URL for the chosen channel (Stable follows
+    /// the latest-release feed; Beta follows the rolling `beta-feed` release,
+    /// which carries every build — pre-release and stable alike).
     public var updateChannel: String {
-        didSet { UserDefaults.standard.set(updateChannel, forKey: AppStateModel.updateChannelKey) }
+        didSet {
+            UserDefaults.standard.set(updateChannel, forKey: AppStateModel.updateChannelKey)
+            NotificationCenter.default.post(name: .traceUpdaterPrefsChanged, object: nil)
+        }
     }
 
     // MARK: Calendar (BAS-24)
@@ -882,9 +908,13 @@ public final class AppStateModel {
     ///
     /// Default OFF — first-enable
     /// watches only NEW recordings unless the user opts into the backlog.
+    /// Writing posts `traceWatchedFoldersChanged` so an already-running watcher
+    /// is rebuilt with the new value (otherwise flipping this after sync is on
+    /// would silently do nothing until the next watcher restart).
     public var voiceMemoImportExisting: Bool {
         didSet {
             UserDefaults.standard.set(voiceMemoImportExisting, forKey: AppStateModel.voiceMemoImportExistingKey)
+            NotificationCenter.default.post(name: .traceWatchedFoldersChanged, object: nil)
         }
     }
 
@@ -901,6 +931,8 @@ public final class AppStateModel {
         // streaming that drops words). Parakeet (FluidAudio, offline) transcribes
         // the whole buffer in one reliable pass.
         self.dictationASREngine = asrRaw.flatMap(DictationASREngine.init(rawValue:)) ?? .parakeet
+        self.parakeetTakeoverPending = UserDefaults.standard.bool(
+            forKey: AppStateModel.parakeetTakeoverPendingKey)
         self.dictationLocalModelID =
             UserDefaults.standard.string(forKey: AppStateModel.dictationLocalModelKey) ?? "parakeet-tdt-v3"
         let cloudASRRaw = UserDefaults.standard.string(forKey: AppStateModel.dictationCloudProviderKey)
@@ -978,7 +1010,7 @@ public final class AppStateModel {
         self.meetingSummaryInstructions =
             UserDefaults.standard.string(forKey: AppStateModel.meetingSummaryInstructionsKey)
             ?? AppStateModel.defaultMeetingSummaryInstructions
-        self.coachEnabled = UserDefaults.standard.object(forKey: AppStateModel.coachEnabledKey) as? Bool ?? true
+        self.coachEnabled = UserDefaults.standard.object(forKey: AppStateModel.coachEnabledKey) as? Bool ?? false
         if let coachConfigData = UserDefaults.standard.data(forKey: AppStateModel.coachConfigKey),
             let decodedCoachConfig = try? JSONDecoder().decode(CoachConfig.self, from: coachConfigData)
         {
@@ -1078,21 +1110,22 @@ public final class AppStateModel {
             for stage in generativeStages {
                 setProvider(provider, for: stage)
             }
-            coachEnabled = true
             meetingLiveSummaryEnabled = true
         case .appleFM:
             for stage in generativeStages {
                 setProvider(.appleFM, for: stage)
             }
-            coachEnabled = true
             meetingLiveSummaryEnabled = true
         case .ollama:
             for stage in generativeStages {
                 setProvider(.ollama, for: stage)
             }
-            coachEnabled = true
             meetingLiveSummaryEnabled = true
         }
+        // Deliberately NOT re-enabling the Coach here: it is a beta feature
+        // that stays opt-in via Coach settings regardless of which provider
+        // onboarding routes the generative stages to. (Picking "off" still
+        // force-disables it above, since nothing should call out in that mode.)
     }
 
     public func markOnboardingComplete() {
@@ -1112,6 +1145,7 @@ public final class AppStateModel {
     private static let onboardingKey = "app.trace.onboardingComplete"
     private static let appearanceKey = "app.trace.appearancePreference"
     static let dictationASRKey = "app.trace.dictation.asrEngine"
+    static let parakeetTakeoverPendingKey = "app.trace.dictation.parakeetTakeoverPending"
     static let dictationLocalModelKey = "app.trace.dictation.localModelID"
     static let dictationCloudProviderKey = "app.trace.dictation.cloudASRProvider"
     static let meetingCloudProviderKey = "app.trace.meeting.cloudASRProvider"

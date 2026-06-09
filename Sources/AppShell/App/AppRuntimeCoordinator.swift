@@ -61,6 +61,14 @@ public final class AppRuntimeCoordinator {
     private var tripleTapMonitor: TripleTapMonitor?
     /// Tap-or-hold monitor when dictation is bound to a lone modifier key.
     private var dictationTriggerMonitor: ModifierTriggerMonitor?
+    /// Bumped on every dictation start AND stop. A start task that wakes up
+    /// from an await (model download, runtime build) with a stale generation
+    /// aborts — the user already said stop.
+    private var dictationStartGeneration: UInt64 = 0
+    /// Swallows a bare Esc while dictation records, turning it into a cancel
+    /// (audio + crash-spool discarded) instead of letting it reach the focused
+    /// app where it could close a dialog.
+    private var escapeCancelInterceptor: EscapeKeyInterceptor?
     /// True while the current lone-modifier press is the one that *started*
     /// dictation — so its release can decide tap (keep recording) vs hold (stop).
     private var dictationTriggerStartedRecording = false
@@ -108,6 +116,9 @@ public final class AppRuntimeCoordinator {
     private var meetingChunkIndexer: MeetingChunkIndexer?
     private var libraryEntryIndexer: LibraryEntryIndexer?
     private var coachSubscriptionTask: Task<Void, Never>?
+    /// App-lifetime subscription to the coach pipeline's health events (the
+    /// orchestrator is cached across meetings, so this is created once with it).
+    private var coachHealthTask: Task<Void, Never>?
     /// Rolling window of recent utterance text — feeds topic-shift detection and
     /// the manual-trigger "help me now" context.
     private var coachRecentText: [String] = []
@@ -137,6 +148,17 @@ public final class AppRuntimeCoordinator {
         // blocked by the reconcile pass.
         Task { [weak self] in
             await self?.bootstrapTask?.value
+            // Storage integrity FIRST: repair FTS↔content desync, close
+            // crash-abandoned meetings, sweep ghost index rows — so everything
+            // downstream (title backfill, index reconciles) sees honest data.
+            await self?.runStorageIntegrityPass()
+            // Re-queue file jobs a crash left stuck in "Transcribing…" (the
+            // controller is otherwise built lazily on first ingest, so without
+            // this the spinner would sit there until a new file is dropped).
+            await self?.recoverInterruptedFileJobs()
+            // A dictation from a previous session crashed mid-recording? Its
+            // audio survived in the spool — point the user at the recovery UI.
+            await self?.surfaceOrphanedDictations()
             // Title backfill first, so the reconcile/embed pass indexes meetings
             // with their generated titles (search citations show the real title,
             // not the date placeholder) rather than re-indexing later.
@@ -147,6 +169,94 @@ public final class AppRuntimeCoordinator {
             // Content-hash gated, so a steady-state launch only re-embeds changed
             // docs; an all-cached pass needs no embedding model at all.
             await self?.reconcilePlaybookIndex()
+        }
+    }
+
+    /// Launch-time storage integrity pass: FTS repair, abandoned-meeting
+    /// closure, ghost cleanup. Repairs are reported as an info notice (the user
+    /// should know search results just changed); a FAILED pass is a warning —
+    /// it means keyword search may quietly miss content.
+    private func runStorageIntegrityPass() async {
+        guard let db = database else { return }
+        do {
+            let report = try await StorageReconciler(database: db).reconcile()
+            if report.didRepairAnything {
+                Loggers.storage.warning("\(report.summary, privacy: .public)")
+                environment.notices.post(
+                    severity: .info,
+                    title: "Library repaired",
+                    message: report.summary,
+                    coalescingKey: "storage.reconcile"
+                )
+            }
+        } catch {
+            Loggers.storage.error(
+                "Storage reconcile failed: \(String(describing: error), privacy: .public)")
+            environment.notices.post(
+                severity: .warning,
+                title: "Library check failed",
+                message:
+                    "The launch integrity check could not finish — keyword search may miss some content until the next successful launch.",
+                coalescingKey: "storage.reconcile"
+            )
+        }
+    }
+
+    /// A dictation from a previous session crashed mid-recording: its audio is
+    /// recoverable from the on-disk spool. Point the user at Library →
+    /// Dictation, where the Recover/Discard affordances live.
+    private func surfaceOrphanedDictations() async {
+        let orphans = LiveDictationRuntime.orphanedDictationSpools()
+        guard !orphans.isEmpty else { return }
+        let count = orphans.count
+        Loggers.dictation.warning(
+            "found \(count, privacy: .public) recoverable dictation spool(s) from a previous session")
+        // Warning, not info: this is actionable and posted at launch, when the
+        // user is least likely to be looking — it must wait to be seen, not
+        // dismiss itself after six seconds.
+        environment.notices.post(
+            severity: .warning,
+            title: count == 1 ? "Unsaved dictation found" : "Unsaved dictations found",
+            message: count == 1
+                ? "A dictation from a previous session didn't finish. Open Library → Dictation to recover or discard it."
+                : "\(count) dictations from a previous session didn't finish. Open Library → Dictation to recover or discard them.",
+            coalescingKey: "dictation.spool.recovery"
+        )
+    }
+
+    /// Re-queue file-transcription jobs that a crash left in a non-terminal
+    /// state, and restart the run loop when anything was re-queued.
+    private func recoverInterruptedFileJobs() async {
+        guard let controller = await ensureFileBatchController() else { return }
+        do {
+            let report = try await controller.recoverInterruptedJobs()
+            if !report.requeued.isEmpty {
+                Loggers.files.info(
+                    "Re-queued \(report.requeued.count, privacy: .public) interrupted file job(s)")
+                await controller.startRunLoop()
+            }
+            if !report.abandoned.isEmpty {
+                // The rows already carry a user-visible failure reason + Retry.
+                environment.notices.post(
+                    severity: .warning,
+                    title: report.abandoned.count == 1
+                        ? "A file could not be transcribed"
+                        : "\(report.abandoned.count) files could not be transcribed",
+                    message:
+                        "Processing kept getting interrupted, so it was stopped. Open Files to retry.",
+                    coalescingKey: "files.recovery"
+                )
+            }
+        } catch {
+            Loggers.files.error(
+                "File job recovery failed: \(String(describing: error), privacy: .public)")
+            environment.notices.post(
+                severity: .warning,
+                title: "File recovery failed",
+                message:
+                    "Interrupted file transcriptions could not be re-queued — they may show as stuck. Retry them from Files.",
+                coalescingKey: "files.recovery"
+            )
         }
     }
 
@@ -167,6 +277,17 @@ public final class AppRuntimeCoordinator {
         let center = NotificationCenter.default
         observeName(.traceStartDictation) { [weak self] _ in self?.runStartDictation() }
         observeName(.traceStopDictation) { [weak self] _ in self?.runStopDictation() }
+        // The crash-recovery spool failed to open/write: dictation continues in
+        // memory, but the user deserves to know the insurance is off right now.
+        observeName(.traceDictationCrashProtectionLost) { [weak self] _ in
+            self?.environment.notices.post(
+                severity: .warning,
+                title: "Recordings aren't crash-protected right now",
+                message:
+                    "Dictation keeps working, but the crash-recovery copy can't be written — check disk space. A crash mid-dictation would lose the take.",
+                coalescingKey: "dictation.spoolProtection"
+            )
+        }
         observeName(.traceStartVoiceMemo) { [weak self] _ in self?.runStartVoiceMemo() }
         observeName(.traceStopVoiceMemo) { [weak self] _ in self?.runStopVoiceMemo() }
         observeName(.traceStartMeeting) { [weak self] _ in self?.runStartMeeting() }
@@ -260,16 +381,16 @@ public final class AppRuntimeCoordinator {
         rebuildTripleTapMonitor()
 
         // Global ⌥esc dismiss for the coach overlay — registered globally (not a
-        // local monitor) so it minimizes the overlay to its pill even when the call
-        // app is frontmost mid-call. esc = keyCode 53. Minimize is the existing
-        // .traceCoachOverlayHide path.
+        // local monitor) so it works even when the call app is frontmost mid-call.
+        // esc = keyCode 53. Posts the genuine dismiss (hide for the rest of the
+        // meeting), matching the local ⌥esc monitor and the Dismiss button.
         Task {
             await self.registerHotkey(
                 center: center,
                 id: "coachOverlayDismiss",
                 descriptor: HotkeyDescriptor(keyCode: 53, modifiers: [.option])
             ) {
-                NotificationCenter.default.post(name: .traceCoachOverlayHide, object: nil)
+                NotificationCenter.default.post(name: .traceCoachOverlayDismiss, object: nil)
             }
         }
     }
@@ -375,6 +496,16 @@ public final class AppRuntimeCoordinator {
             Loggers.bridges.error(
                 "Failed to register hotkey \(id, privacy: .public): \(error.localizedDescription, privacy: .public)"
             )
+            // A shortcut that silently fails to register looks identical to a
+            // working one until the user presses it and nothing happens — say so.
+            environment.notices.post(
+                severity: .error,
+                title: "Keyboard shortcut not registered",
+                message:
+                    "The global shortcut for “\(HotkeyAction(rawValue: id)?.title ?? id)” could not be registered — it may clash with another app's shortcut. Pick a different binding in Settings.",
+                actions: [.openSettingsTab(.hotkeys, label: "Open Settings → Keyboard shortcuts")],
+                coalescingKey: "hotkey.register.\(id)"
+            )
         }
     }
 
@@ -392,6 +523,17 @@ public final class AppRuntimeCoordinator {
             } catch {
                 Loggers.bootstrap.error(
                     "AppRuntimeCoordinator bootstrap failed: \(error.localizedDescription, privacy: .public)"
+                )
+                // Without this banner, the failure mode is an app that simply
+                // LOOKS empty — blank library, blank files — until the user
+                // happens to start a capture and finally hits a loud error.
+                environment.notices.post(
+                    severity: .error,
+                    title: "Trace's storage couldn't be opened",
+                    message:
+                        "\(error.localizedDescription) Your library can't be shown and new recordings can't be saved. Restart Trace; if this keeps happening, check Diagnostics.",
+                    actions: [.openSettingsTab(.diagnostics, label: "Open Settings → Diagnostics")],
+                    coalescingKey: "storage.bootstrap"
                 )
                 return
             }
@@ -446,7 +588,18 @@ public final class AppRuntimeCoordinator {
     /// `.traceProjectOverridesChanged`.
     private func hydrateProjectOverrides() async {
         guard let store = environment.projectStore, let router, let asrRouter else { return }
-        let records = (try? await store.list()) ?? []
+        let records: [ProjectRecord]
+        do {
+            records = try await store.list()
+        } catch {
+            // Bail, don't treat failure as "no projects": an empty list here
+            // would mark every hydrated project stale and silently strip ALL
+            // per-project routing overrides on a transient read error.
+            Loggers.bootstrap.error(
+                "Project list failed during override hydration — keeping existing overrides: \(error.localizedDescription, privacy: .public)"
+            )
+            return
+        }
         let currentIDs = Set(records.map(\.id))
         for staleID in hydratedProjectIDs.subtracting(currentIDs) {
             await router.clearProjectLLMOverrides(projectID: staleID)
@@ -710,6 +863,28 @@ public final class AppRuntimeCoordinator {
                 onPartial: onPartial,
                 onLevel: onLevel
             )
+            // A dead mic mid-dictation must not leave "listening" on screen with
+            // a running timer capturing nothing. On an unrecoverable rebuild
+            // failure, stop the dictation — that salvages whatever audio was
+            // already collected (plus the crash spool) — and say what happened.
+            runtime.audio.setOnHealthEvent { [weak self] event in
+                guard case .rebuildFailed(let reason) = event else { return }
+                Task { @MainActor in
+                    guard let self else { return }
+                    Loggers.dictation.error(
+                        "Microphone capture died mid-dictation: \(reason, privacy: .public)")
+                    self.environment.notices.post(
+                        severity: .error,
+                        title: "Microphone stopped working",
+                        message:
+                            "The microphone failed and couldn't recover, so the dictation was ended. Whatever was captured has been kept.",
+                        coalescingKey: "dictation.micDead"
+                    )
+                    if self.environment.state.activeCapture.mode == .dictation {
+                        self.runStopDictation()
+                    }
+                }
+            }
             self.dictationRuntime = runtime
             Loggers.bootstrap.info(
                 "LiveDictationRuntime constructed (asr=\(asrEngine.rawValue, privacy: .public), cleanup=\(self.environment.state.dictationCleanupProvider.rawValue, privacy: .public))"
@@ -959,9 +1134,15 @@ public final class AppRuntimeCoordinator {
         let liveSummary: LiveSummaryEngine?
         if environment.state.meetingLiveSummaryEnabled {
             let cadence = environment.state.meetingLiveSummaryCadenceSeconds
-            liveSummary = LiveSummaryEngine(router: self.router, cadenceSeconds: Double(cadence)) { text, isFinal in
+            let engine = LiveSummaryEngine(router: self.router, cadenceSeconds: Double(cadence)) { text, isFinal in
                 await MainActor.run { liveModel.setSummary(text, isFinal: isFinal) }
             }
+            // Staleness honesty: when ticks start failing, the AI-Summary column
+            // would otherwise just quietly freeze — show a pill until it recovers.
+            await engine.setOnHealthNotice { notice in
+                await MainActor.run { liveModel.setEngineNotice(notice) }
+            }
+            liveSummary = engine
         } else {
             liveSummary = nil
         }
@@ -1055,6 +1236,20 @@ public final class AppRuntimeCoordinator {
         // meetings.title; resolves the session id at call time on the main actor.
         environment.state.meetingLive.titleSink = { [weak self] text in
             await self?.persistLiveMeetingTitle(text)
+        }
+        // Post-finalise work (categorisation, RAG indexing, voiceprint refresh)
+        // needs the generated title + summary, which under detached finalise
+        // land AFTER stop() returns — so it hangs off the tail's completion,
+        // keyed to the finalised session id (a new meeting may already be live).
+        runtime.onFinalizeComplete = { [weak self] sessionId in
+            guard let self else { return }
+            await self.environment.state.meetingLibrary.refresh()
+            await self.runAutoCategorization(sessionId: sessionId)
+            await self.indexFinalizedMeeting(sessionId: sessionId)
+            // A finished meeting may have enrolled / refreshed voiceprints.
+            await self.refreshRememberedSpeakerCount()
+            // Keep retained recordings under the cache budget (BAS-44).
+            self.pruneAudioArchiveToBudget()
         }
         meetingRuntime = runtime
         Loggers.meeting.info("MeetingRuntime constructed lazily on first meeting capture")
@@ -1209,6 +1404,30 @@ public final class AppRuntimeCoordinator {
         )
     }
 
+    /// Refresh the live vector indices (library Q&A + coach RAG), surfacing
+    /// failure as one coalesced warning banner instead of silently leaving
+    /// semantic search stale — and clearing that banner again the moment a
+    /// refresh succeeds (self-healing should look healed).
+    private func refreshVectorIndicesLoudly(context: String) async {
+        do {
+            try await ensureLibraryVectorSearch()?.refresh()
+            try await coachVectorSearch?.refresh()
+            environment.notices.clear(coalescingKey: "library.vectorRefresh")
+        } catch {
+            Loggers.library.warning(
+                "Vector index refresh failed (\(context, privacy: .public)): \(error.localizedDescription, privacy: .public)"
+            )
+            environment.notices.post(
+                severity: .warning,
+                title: "Search index not refreshed",
+                message:
+                    "Recently added content may be missing from search until the embedding model is reachable again. Check the embeddings provider in Settings.",
+                actions: [.openSettingsTab(.llmRouter, label: "Open Settings → AI models")],
+                coalescingKey: "library.vectorRefresh"
+            )
+        }
+    }
+
     /// Index every playbook folder into the shared RAG corpus and refresh the live
     /// vector indices so library Q&A + the next coach lookup see the new chunks
     /// (the coach also refreshes at meeting start).
@@ -1225,8 +1444,7 @@ public final class AppRuntimeCoordinator {
             // (re)embedded — an all-cached steady-state pass leaves them valid, so
             // skip the full kb_chunks rescan.
             if report.embedded > 0 {
-                try? await ensureLibraryVectorSearch()?.refresh()
-                try? await coachVectorSearch?.refresh()
+                await refreshVectorIndicesLoudly(context: "playbook indexing")
             }
             return report.indexed
         } catch {
@@ -1295,13 +1513,39 @@ public final class AppRuntimeCoordinator {
         }
         environment.state.meetingLibrary.assignProjectAction = { [weak self] sessionId, projectId in
             guard let self, let repo = self.ensureLibraryRepository() else { return }
-            try? await repo.assignProject(
-                sessionId: sessionId, projectId: projectId, manualOverride: true
-            )
+            do {
+                try await repo.assignProject(
+                    sessionId: sessionId, projectId: projectId, manualOverride: true
+                )
+            } catch {
+                Loggers.meeting.error(
+                    "Filing meeting \(sessionId, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                )
+                self.environment.notices.post(
+                    severity: .warning,
+                    title: "Meeting not filed",
+                    message: "The meeting could not be moved into the project — it stays where it was. Try again.",
+                    coalescingKey: "meeting.assignProject"
+                )
+            }
         }
         environment.state.meetingLibrary.deleteAction = { [weak self] sessionId in
             guard let self, let repo = self.ensureLibraryRepository() else { return }
-            try? await repo.deleteMeeting(sessionId: sessionId)
+            do {
+                try await repo.deleteMeeting(sessionId: sessionId)
+            } catch {
+                // A failed delete must never look like a delete — especially for
+                // a meeting the user may consider sensitive.
+                Loggers.meeting.error(
+                    "Deleting meeting \(sessionId, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                )
+                self.environment.notices.post(
+                    severity: .error,
+                    title: "Meeting not deleted",
+                    message: "The meeting could not be deleted: \(error.localizedDescription). Try again.",
+                    coalescingKey: "meeting.delete"
+                )
+            }
         }
         environment.state.meetingLibrary.loadMeeting = { [weak self] meta in
             guard let self, let repo = self.ensureLibraryRepository() else { return nil }
@@ -1541,22 +1785,24 @@ public final class AppRuntimeCoordinator {
     ///
     /// Runs after auto-categorization so chunk provenance carries the final
     /// project id.
-    private func indexFinalizedMeeting() async {
+    private func indexFinalizedMeeting(sessionId targetSessionId: String) async {
+        // Resolved by id, not `.first` — under detached finalise a NEW meeting
+        // may already be live by the time this session's tail completes.
         guard let repo = ensureLibraryRepository(),
             let indexer = makeMeetingChunkIndexer(),
-            let latest = environment.state.meetingLibrary.meetings.first
+            let latest = environment.state.meetingLibrary.meetings.first(where: {
+                $0.sessionId == targetSessionId
+            })
         else { return }
         let saved = await repo.loadSavedMeeting(latest)
-        // Capture this session's live speaker renames (in-memory on `meetingLive`,
-        // still present here because `MeetingRuntime.stop()` calls `end()`, not
-        // `reset()`) so citations show real names instead of "Speaker N". The
-        // cross-relaunch / reconcile path can't see these — that needs persisted
-        // names (BAS-11).
-        let speakerNames = environment.state.meetingLive.speakerNames
+        // Speaker renames come from the persisted speakers.json (written during
+        // the finalise tail) rather than the in-memory live model — the live
+        // model may already belong to a NEW meeting by the time the tail ends.
+        let speakerNames = MeetingSpeakerNames.load(sessionDirPath: latest.sessionDirPath)
         do {
             let report = try await indexer.index(meeting: saved, speakerNames: speakerNames)
             if report.embedded > 0 {
-                try? await ensureLibraryVectorSearch()?.refresh()
+                await refreshVectorIndicesLoudly(context: "meeting indexing")
                 Loggers.library.info(
                     "Indexed finalized meeting \(latest.sessionId, privacy: .public): \(report.embedded) chunks"
                 )
@@ -1586,7 +1832,7 @@ public final class AppRuntimeCoordinator {
                 if let report = try? await indexer.index(meeting: saved, speakerNames: names),
                     report.embedded > 0
                 {
-                    try? await ensureLibraryVectorSearch()?.refresh()
+                    await refreshVectorIndicesLoudly(context: "speaker rename")
                 }
             }
         } catch {
@@ -1735,7 +1981,7 @@ public final class AppRuntimeCoordinator {
             }
         }
         if embeddedAny {
-            try? await ensureLibraryVectorSearch()?.refresh()
+            await refreshVectorIndicesLoudly(context: "library reconcile")
             Loggers.library.info("Meeting index reconcile complete (\(metas.count, privacy: .public) meetings)")
         }
     }
@@ -1795,10 +2041,21 @@ public final class AppRuntimeCoordinator {
             )
             model.setSummary(result.markdown, isFinal: true)
             let url = URL(fileURLWithPath: meta.sessionDirPath).appendingPathComponent("summary.md")
-            try? result.markdown.write(to: url, atomically: true, encoding: .utf8)
+            do {
+                try result.markdown.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                // The regenerated summary is on screen but didn't reach disk —
+                // it would silently revert to the old one on next open.
+                Loggers.meeting.error(
+                    "Persist regenerated summary failed: \(error.localizedDescription, privacy: .public)")
+                model.raiseStorageNotice(
+                    "The regenerated summary could not be saved — it will revert when this meeting is reopened.")
+            }
         } catch {
             Loggers.meeting.error("Regenerate summary failed: \(error.localizedDescription, privacy: .public)")
-            model.setSummary("Couldn't build the summary.\n\n\(self.summaryFailureHint(error))", isFinal: true)
+            // First-class failure state → the view shows the message + Try again,
+            // instead of error text masquerading as a summary body.
+            model.setSummaryFailed("Couldn't build the summary. \(self.summaryFailureHint(error))")
         }
     }
 
@@ -1854,6 +2111,22 @@ public final class AppRuntimeCoordinator {
             model: RoutedConversationStateModel(router: router)
         )
         self.coachOrchestrator = orchestrator
+        // Surface pipeline health on the overlay (banner + pill warning) — the
+        // orchestrator emits edge-triggered events (one per outage, one per
+        // recovery), so no rate limiting is needed here.
+        coachHealthTask?.cancel()
+        coachHealthTask = Task { [weak self] in
+            let stream = await orchestrator.healthEvents()
+            for await event in stream {
+                guard let self else { break }
+                self.coachOverlay?.applyHealthEvent(event)
+                if case .stageUnavailable(let stage, let reason) = event {
+                    Loggers.bridges.error(
+                        "Coach stage unavailable: \(String(describing: stage), privacy: .public) — \(reason, privacy: .public)"
+                    )
+                }
+            }
+        }
         return orchestrator
     }
 
@@ -1952,6 +2225,8 @@ public final class AppRuntimeCoordinator {
         guard config.enabled, let orchestrator = ensureCoachOrchestrator() else { return }
         coachRecentText.removeAll()
         coachOverlay?.applyAppearance(environment.state.appearancePreference)
+        // Fresh meeting → clean health banner, skip counter and dismissal state.
+        coachOverlay?.prepareForNewMeeting()
         // Start in the compact listening pill — don't auto-pop a full card at
         // meeting start. A real card flips it open (CoachOverlayController.update).
         coachOverlay?.minimizeToPill()
@@ -1966,7 +2241,10 @@ public final class AppRuntimeCoordinator {
             // surface budget + throttle and load any indexed playbook embeddings.
             await orchestrator.updateConfig(config)
             await orchestrator.beginMeeting(projectID: projectID)
-            try? await self?.coachVectorSearch?.refresh()
+            // Loud refresh: a down embedding model at meeting start would
+            // otherwise silently ground the coach on a stale index (the
+            // per-utterance path can't catch it — its evaluate still succeeds).
+            await self?.refreshVectorIndicesLoudly(context: "coach start")
             for await utt in runtime.utteranceStream() {
                 guard let self else { break }
                 self.appendCoachWindow(utt.text)
@@ -1976,13 +2254,38 @@ public final class AppRuntimeCoordinator {
                     timestamp: Date(),
                     userRequested: false
                 )
-                do {
-                    let result = try await orchestrator.ingest(
-                        utterance: cu, windowText: self.coachWindowText()
-                    )
-                    self.applyCoachResult(result)
-                } catch {
-                    Loggers.bridges.debug("Coach ingest failed: \(error.localizedDescription, privacy: .public)")
+                // Detach per utterance so a slow LLM can't make the stream back
+                // up behind one cue. `enqueue` bounds concurrency (max 2 in
+                // flight; the newest waiting utterance supersedes older ones —
+                // a superseded call returns nil and is surfaced via the
+                // `.cueSkipped` health event, never silently).
+                let windowText = self.coachWindowText()
+                Task { [weak self] in
+                    do {
+                        if let result = try await orchestrator.enqueue(
+                            utterance: cu, windowText: windowText
+                        ) {
+                            self?.applyCoachResult(result)
+                        }
+                    } catch {
+                        // The orchestrator already emitted a stageUnavailable
+                        // health event before rethrowing — the overlay banner is
+                        // driving the user-visible side. The notice is a backstop
+                        // for when the overlay itself is dismissed; coalesced, so
+                        // a model that's down all meeting yields one banner.
+                        Loggers.bridges.warning(
+                            "Coach ingest failed: \(error.localizedDescription, privacy: .public)")
+                        self?.environment.notices.post(
+                            severity: .warning,
+                            title: "Coach paused",
+                            message:
+                                "The coach could not analyse the conversation — its model may be unavailable. It will resume automatically if the model recovers.",
+                            actions: [
+                                .openSettingsTab(.coachTriggers, label: "Open Settings → Meeting coach")
+                            ],
+                            coalescingKey: "coach.ingest"
+                        )
+                    }
                 }
             }
         }
@@ -2087,8 +2390,11 @@ public final class AppRuntimeCoordinator {
         // timer that looks live but isn't, then flip to the real session once
         // the model is ready. Subsequent dictations skip this (runtime cached).
         let firstBuild = (dictationRuntime == nil)
+        dictationStartGeneration &+= 1
+        let myGeneration = dictationStartGeneration
         environment.state.activeCapture.beginDictation(sessionId: "dictation-\(Int(Date().timeIntervalSince1970))")
         installEnterInterceptorIfEnabled()
+        installEscapeCancelInterceptor()
         notchHUD?.showCompact(timer: "0:00", kind: firstBuild ? .preparing : .listening)
         Loggers.dictation.info("AppCommands.startDictation invoked (firstBuild=\(firstBuild, privacy: .public))")
         Task { [weak self] in
@@ -2101,6 +2407,14 @@ public final class AppRuntimeCoordinator {
             guard await self.awaitDictationModelIfNeeded() else {
                 Loggers.dictation.error("startDictation: speech model download failed")
                 self.notchHUD?.setKind(.downloadFailed)
+                self.environment.notices.post(
+                    severity: .error,
+                    title: "Speech model download failed",
+                    message:
+                        "The Parakeet model could not be downloaded, so dictation cannot start. Check your connection and try again, or switch dictation to another engine.",
+                    actions: [.openSettingsTab(.dictationModels, label: "Open Settings → Dictation models")],
+                    coalescingKey: "dictation.modelDownload"
+                )
                 try? await Task.sleep(nanoseconds: 2_600_000_000)
                 self.abortDictationStartup()
                 return
@@ -2108,8 +2422,24 @@ public final class AppRuntimeCoordinator {
             guard let runtime = await self.ensureDictationRuntime() else {
                 Loggers.dictation.error("startDictation: runtime unavailable")
                 self.notchHUD?.setKind(.unavailable)
+                self.environment.notices.post(
+                    severity: .error,
+                    title: "Dictation could not start",
+                    message:
+                        "The dictation engine could not be prepared. Check the engine and model selection in Settings.",
+                    actions: [.openSettingsTab(.dictationModels, label: "Open Settings → Dictation models")],
+                    coalescingKey: "dictation.runtime"
+                )
                 try? await Task.sleep(nanoseconds: 2_400_000_000)
                 self.abortDictationStartup()
+                return
+            }
+            // Stop-before-ready: if the user pressed stop while the model or
+            // runtime was still coming up, this start is stale — abort instead
+            // of zombie-recording with no HUD (runStopDictation already tore
+            // the chrome down).
+            guard self.dictationStartGeneration == myGeneration else {
+                Loggers.dictation.info("startDictation: superseded while preparing — aborted")
                 return
             }
             if firstBuild {
@@ -2118,12 +2448,62 @@ public final class AppRuntimeCoordinator {
                 self.notchHUD?.state.startedAt = Date()
                 self.notchHUD?.setKind(.listening)
             }
+            // If the previous cycle's tail is still finishing, startCapture
+            // CHAINS (event-driven, starts the instant the tail completes) —
+            // be honest in the HUD while that happens.
+            let pre = await runtime.controller.currentState()
+            if pre != .idle && !pre.isTerminal && pre != .recording {
+                self.notchHUD?.setKind(.stillFinishing)
+            }
             do {
-                try await runtime.controller.startCapture(mode: .toggle)
+                // Mint the controller-side epoch right before starting; a stop
+                // arriving between here and recording bumps it and the start
+                // unwinds itself (audio + ASR cycle + spool all cleaned up).
+                let token = await runtime.controller.currentEpoch()
+                try await runtime.controller.startCapture(mode: .toggle, epoch: token)
+                self.notchHUD?.setKind(.listening)
+            } catch let startError as DictationStartError {
+                switch startError {
+                case .cancelledBeforeStart:
+                    // The user already said stop — quiet exit, no scary banner.
+                    Loggers.dictation.info("startDictation: cancelled before start")
+                    self.abortDictationStartup()
+                case .busyFinishingPrevious:
+                    self.notchHUD?.setKind(.stillFinishing)
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    self.abortDictationStartup()
+                }
             } catch {
+                // A start failure must never leave the HUD pretending to record —
+                // tear the session down and say what happened, loudly.
                 Loggers.dictation.error(
-                    "startCapture failed: \(error.localizedDescription, privacy: .public)"
+                    "startCapture failed: \(String(describing: error), privacy: .public)"
                 )
+                if let traceError = error as? TraceError {
+                    switch traceError {
+                    case .permissionDenied(kind: .microphone), .audioDeviceMissing, .audioCaptureFailed:
+                        self.notchHUD?.setKind(.micUnavailable)
+                    case .asrModelMissing:
+                        self.notchHUD?.setKind(.modelMissing)
+                    default:
+                        self.notchHUD?.setKind(.failed)
+                    }
+                    self.environment.notices.post(
+                        traceError,
+                        title: "Dictation could not start",
+                        coalescingKey: "dictation.start"
+                    )
+                } else {
+                    self.notchHUD?.setKind(.failed)
+                    self.environment.notices.post(
+                        severity: .error,
+                        title: "Dictation could not start",
+                        message: error.localizedDescription,
+                        coalescingKey: "dictation.start"
+                    )
+                }
+                try? await Task.sleep(nanoseconds: 2_400_000_000)
+                self.abortDictationStartup()
             }
         }
     }
@@ -2154,9 +2534,13 @@ public final class AppRuntimeCoordinator {
     }
 
     private func runStopDictation(submitAfterInsert: Bool = false) {
-        // Always retire the Return interceptor first: dictation is ending, and
-        // tearing it down before we post any synthetic Return rules out a loop.
+        // Always retire the interceptors first: dictation is ending, and
+        // tearing them down before we post any synthetic Return rules out a loop.
         teardownEnterInterceptor()
+        teardownEscapeCancelInterceptor()
+        // Kill any start still preparing (model download / runtime build) —
+        // without this, stop-before-ready left a zombie capture with no HUD.
+        dictationStartGeneration &+= 1
         environment.state.activeCapture.end()
         // Update just the label — keep the same startedAt so the elapsed
         // timer counts from when the user first hit ⌥Space instead of
@@ -2174,6 +2558,10 @@ public final class AppRuntimeCoordinator {
                 self.notchHUD?.hide()
                 return
             }
+            // Invalidate any startCapture still arming (controller epoch), so a
+            // stop that lands mid-arming cancels that pending cycle rather than
+            // letting it reach .recording with no HUD.
+            _ = await runtime.controller.invalidatePendingStarts()
             do {
                 let result = try await runtime.controller.stopCapture()
                 if let result {
@@ -2182,6 +2570,11 @@ public final class AppRuntimeCoordinator {
                     )
                     if result.cleanedText.isEmpty {
                         self.notchHUD?.setKind(.noAudio)
+                    } else if result.pasteStrategy == .secureFieldRefused {
+                        // Password field: the text was NOT inserted and was NOT
+                        // put on the clipboard. Saying "Copied" here would be a
+                        // lie — and a security smell.
+                        self.notchHUD?.setKind(.secureField)
                     } else if !result.pasted {
                         // Text only made it to the clipboard (no Accessibility /
                         // AX insert) — there's nothing in the field to submit, so
@@ -2194,12 +2587,37 @@ public final class AppRuntimeCoordinator {
                         }
                     }
                     try? await Task.sleep(nanoseconds: 1_400_000_000)
+                } else {
+                    // stopCapture was a no-op: nothing was recording. If a cycle
+                    // is still ARMING (stop raced the start), cancel it so it
+                    // can't become a zombie recording.
+                    let state = await runtime.controller.currentState()
+                    if !state.isTerminal && state != .idle {
+                        await runtime.controller.cancel()
+                    }
                 }
             } catch {
                 Loggers.dictation.error(
                     "stopCapture failed: \(String(describing: error), privacy: .public)"
                 )
                 self.notchHUD?.setKind(.failed)
+                // The HUD's failure pill disappears after a beat — leave a
+                // durable explanation with a way forward.
+                if let traceError = error as? TraceError {
+                    self.environment.notices.post(
+                        traceError,
+                        title: "Dictation failed to finish",
+                        coalescingKey: "dictation.stop"
+                    )
+                } else {
+                    self.environment.notices.post(
+                        severity: .error,
+                        title: "Dictation failed to finish",
+                        message:
+                            "\(error.localizedDescription) The recording's raw transcript, if any was produced, is kept in Library → Dictations.",
+                        coalescingKey: "dictation.stop"
+                    )
+                }
                 try? await Task.sleep(nanoseconds: 1_400_000_000)
             }
             self.notchHUD?.hide()
@@ -2207,9 +2625,23 @@ public final class AppRuntimeCoordinator {
     }
 
     private func toggleDictation() {
-        if environment.state.activeCapture.mode == .dictation {
+        switch environment.state.activeCapture.mode {
+        case .dictation:
             runStopDictation()
-        } else {
+        case .meeting, .voiceMemo:
+            // Starting dictation over a live meeting/memo would overwrite the
+            // active-capture state and contend for the microphone — refuse
+            // loudly instead of corrupting the running session.
+            let what = environment.state.activeCapture.mode == .meeting ? "meeting" : "voice memo"
+            Loggers.dictation.warning("toggleDictation ignored — a \(what, privacy: .public) is being recorded")
+            environment.notices.post(
+                severity: .warning,
+                title: "Dictation unavailable",
+                message:
+                    "A \(what) is being recorded. Stop it first, then start dictation.",
+                coalescingKey: "dictation.busy"
+            )
+        case .idle:
             runStartDictation()
         }
     }
@@ -2230,11 +2662,29 @@ public final class AppRuntimeCoordinator {
         case .started:
             enterKeyInterceptor = interceptor
         case .missingPermission:
+            // The user explicitly enabled "Return sends" — without this banner,
+            // Return just types a newline into the target app with no clue why.
             Loggers.dictation.info(
                 "Return-to-send: Accessibility not granted; leaving Return alone this session"
             )
+            environment.notices.post(
+                severity: .warning,
+                title: "“Press Return to send” can't work",
+                message:
+                    "It needs Accessibility access to intercept the Return key. Grant it in System Settings, or turn the option off in Settings → Modes & prompts.",
+                actions: [
+                    .openSystemSettings(pane: "Privacy_Accessibility", label: "Open System Settings")
+                ],
+                coalescingKey: "dictation.enterInterceptor"
+            )
         case .failed:
             Loggers.dictation.error("Return-to-send: event tap creation failed")
+            environment.notices.post(
+                severity: .warning,
+                title: "“Press Return to send” can't work",
+                message: "The key listener could not be created — Return will type a newline as normal this session.",
+                coalescingKey: "dictation.enterInterceptor"
+            )
         }
     }
 
@@ -2243,25 +2693,67 @@ public final class AppRuntimeCoordinator {
         enterKeyInterceptor = nil
     }
 
+    /// Armed for every dictation: Esc cancels the recording outright (audio +
+    /// crash-spool discarded, nothing inserted), and the Escape never reaches
+    /// the focused app where it could close a dialog.
+    private func installEscapeCancelInterceptor() {
+        teardownEscapeCancelInterceptor()
+        let interceptor = EscapeKeyInterceptor { [weak self] in
+            self?.runCancelDictation()
+        }
+        switch interceptor.start() {
+        case .started:
+            escapeCancelInterceptor = interceptor
+        case .missingPermission:
+            Loggers.dictation.info("Esc-to-cancel: Accessibility not granted; Esc left alone this session")
+        case .failed:
+            Loggers.dictation.error("Esc-to-cancel: event tap creation failed")
+        }
+    }
+
+    private func teardownEscapeCancelInterceptor() {
+        escapeCancelInterceptor?.stop()
+        escapeCancelInterceptor = nil
+    }
+
+    /// Esc pressed while dictating: bin the recording. Controller-side this
+    /// stops audio, discards buffered samples AND the crash-recovery spool, and
+    /// invalidates any start still arming.
+    private func runCancelDictation() {
+        teardownEnterInterceptor()
+        teardownEscapeCancelInterceptor()
+        dictationStartGeneration &+= 1
+        environment.state.activeCapture.end()
+        Loggers.dictation.info("dictation cancelled via Esc")
+        Task { [weak self] in
+            guard let self else { return }
+            if let runtime = self.dictationRuntime {
+                await runtime.controller.cancel()  // also bumps the controller epoch
+            }
+            self.notchHUD?.setKind(.cancelled)
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            self.notchHUD?.hide()
+        }
+    }
+
     /// Clean up a dictation that never got off the ground (model download failed,
-    /// runtime unavailable): retire the Return interceptor and clear the capture
+    /// runtime unavailable): retire the interceptors and clear the capture
     /// chrome. These early-exit paths don't run through `runStopDictation` (which
     /// would kick off transcription), so they own their own teardown.
     private func abortDictationStartup() {
         teardownEnterInterceptor()
+        teardownEscapeCancelInterceptor()
         environment.state.activeCapture.end()
         notchHUD?.hide()
     }
 
-    /// Fire a synthetic Return to submit, a beat after the transcript landed.
-    ///
-    /// Only reached when the insert genuinely succeeded with non-empty text, so
-    /// we never submit an empty or clipboard-only message. The short delay lets
-    /// the focused app finish ingesting the inserted text (enable its send
-    /// button, update its editor model) before Return arrives.
+    /// Submit via the paste actor: it verifies the inserted text is actually
+    /// present (AX path) or scales the settle delay for slow web/Electron
+    /// targets, and refuses outright when nothing was inserted — replacing the
+    /// old blind 70 ms-then-Return.
     private func submitReturnAfterInsert() async {
-        try? await Task.sleep(nanoseconds: 70_000_000)
-        let sent = await CGEventKeySynthesizer().send(.returnKey)
+        guard let runtime = dictationRuntime else { return }
+        let sent = await runtime.pasteActor.submitReturn()
         Loggers.dictation.info("Return-to-send: submitted=\(sent, privacy: .public)")
     }
 
@@ -2272,6 +2764,16 @@ public final class AppRuntimeCoordinator {
         Task { [weak self] in
             guard let self else { return }
             guard let runtime = await self.ensureDictationRuntime() else {
+                self.notchHUD?.setKind(.unavailable)
+                self.environment.notices.post(
+                    severity: .error,
+                    title: "Voice memo could not start",
+                    message:
+                        "The recording engine could not be prepared. Check the engine and model selection in Settings.",
+                    actions: [.openSettingsTab(.dictationModels, label: "Open Settings → Dictation models")],
+                    coalescingKey: "voiceMemo.start"
+                )
+                try? await Task.sleep(nanoseconds: 2_400_000_000)
                 self.environment.state.activeCapture.end()
                 self.notchHUD?.hide()
                 return
@@ -2285,6 +2787,17 @@ public final class AppRuntimeCoordinator {
                 Loggers.files.error("VoiceMemoCapture.start failed: \(error.localizedDescription, privacy: .public)")
                 self.environment.state.activeCapture.end()
                 self.notchHUD?.setKind(.failed)
+                if let traceError = error as? TraceError {
+                    self.environment.notices.post(
+                        traceError, title: "Voice memo could not start", coalescingKey: "voiceMemo.start")
+                } else {
+                    self.environment.notices.post(
+                        severity: .error,
+                        title: "Voice memo could not start",
+                        message: error.localizedDescription,
+                        coalescingKey: "voiceMemo.start"
+                    )
+                }
                 try? await Task.sleep(nanoseconds: 1_800_000_000)
                 self.notchHUD?.hide()
             }
@@ -2307,6 +2820,18 @@ public final class AppRuntimeCoordinator {
                 if let controller = await self.ensureFileBatchController() {
                     try await controller.enqueue(job, engine: await self.engineLabel(for: job))
                     await controller.startRunLoop()
+                } else {
+                    // The recording exists on disk but can't be queued for
+                    // transcription — without this banner it would simply never
+                    // appear in Files, as if the memo had vanished.
+                    Loggers.files.error("Voice memo recorded but could not be queued (no batch controller)")
+                    self.environment.notices.post(
+                        severity: .error,
+                        title: "Voice memo not transcribed",
+                        message:
+                            "The recording was saved at \(job.sourceURL.path) but couldn't be queued for transcription — storage is unavailable. Restart Trace and add it from Files.",
+                        coalescingKey: "voiceMemo.enqueue"
+                    )
                 }
                 Loggers.files.info("VoiceMemoCapture.stop produced job \(job.id.uuidString, privacy: .public)")
                 self.environment.state.activeCapture.end()
@@ -2324,15 +2849,43 @@ public final class AppRuntimeCoordinator {
     }
 
     private func toggleVoiceMemo() {
-        if environment.state.activeCapture.mode == .voiceMemo {
+        switch environment.state.activeCapture.mode {
+        case .voiceMemo:
             runStopVoiceMemo()
-        } else {
+        case .dictation, .meeting:
+            // Starting a memo over a live dictation/meeting would overwrite the
+            // active-capture state and contend for the microphone — refuse
+            // loudly instead of corrupting the running session.
+            let what = environment.state.activeCapture.mode == .meeting ? "meeting" : "dictation"
+            Loggers.files.warning("toggleVoiceMemo ignored — a \(what, privacy: .public) is being recorded")
+            environment.notices.post(
+                severity: .warning,
+                title: "Voice memo unavailable",
+                message: "A \(what) is being recorded. Stop it first, then record the memo.",
+                coalescingKey: "capture.busy"
+            )
+        case .idle:
             runStartVoiceMemo()
         }
     }
 
     private func runStartMeeting() {
         Loggers.meeting.info("AppCommands.startMeeting invoked")
+        // Covers every entry point (hotkey, menu, auto-detect, the call
+        // prompt): never start a meeting over a live dictation/memo — it would
+        // clobber the capture state and contend for the microphone.
+        let mode = environment.state.activeCapture.mode
+        guard mode == .idle || mode == .meeting else {
+            let what = mode == .dictation ? "dictation" : "voice memo"
+            Loggers.meeting.warning("startMeeting ignored — a \(what, privacy: .public) is being recorded")
+            environment.notices.post(
+                severity: .warning,
+                title: "Meeting capture unavailable",
+                message: "A \(what) is being recorded. Stop it first, then start the meeting.",
+                coalescingKey: "capture.busy"
+            )
+            return
+        }
         // We're capturing now — stop any armed auto-detect poll + dismiss prompt.
         autoDetectTask?.cancel()
         autoDetectTask = nil
@@ -2341,7 +2894,22 @@ public final class AppRuntimeCoordinator {
         meetingSessionEpoch += 1
         let epoch = meetingSessionEpoch
         Task { [weak self] in
-            guard let self, let runtime = await self.ensureMeetingRuntime() else { return }
+            guard let self else { return }
+            guard let runtime = await self.ensureMeetingRuntime() else {
+                // Bootstrap failed (no database) — without this banner the HUD
+                // just never appears and the user is left guessing.
+                self.environment.state.activeCapture.end()
+                self.notchHUD?.hide()
+                self.environment.notices.post(
+                    severity: .error,
+                    title: "Meeting could not start",
+                    message:
+                        "Trace's storage is unavailable, so the meeting could not begin. Restart the app; if this keeps happening, check Diagnostics.",
+                    actions: [.openSettingsTab(.diagnostics, label: "Open Settings → Diagnostics")],
+                    coalescingKey: "meeting.start"
+                )
+                return
+            }
             do {
                 let projectContext = self.environment.state.currentProjectContext
                 let sessionID = try await runtime.start(
@@ -2369,14 +2937,40 @@ public final class AppRuntimeCoordinator {
                 Loggers.meeting.error(
                     "Meeting capture start failed: \(error.localizedDescription, privacy: .public)"
                 )
+                if let traceError = error as? TraceError {
+                    self.environment.notices.post(
+                        traceError,
+                        title: "Meeting could not start",
+                        coalescingKey: "meeting.start"
+                    )
+                } else {
+                    self.environment.notices.post(
+                        severity: .error,
+                        title: "Meeting could not start",
+                        message: error.localizedDescription,
+                        coalescingKey: "meeting.start"
+                    )
+                }
             }
         }
     }
 
     private func toggleMeeting() {
-        if environment.state.activeCapture.mode == .meeting {
+        switch environment.state.activeCapture.mode {
+        case .meeting:
             runStopMeeting()
-        } else {
+        case .dictation, .voiceMemo:
+            // Same protection as the other direction: a meeting started over a
+            // live dictation/memo would clobber the capture state mid-session.
+            let what = environment.state.activeCapture.mode == .dictation ? "dictation" : "voice memo"
+            Loggers.meeting.warning("toggleMeeting ignored — a \(what, privacy: .public) is being recorded")
+            environment.notices.post(
+                severity: .warning,
+                title: "Meeting capture unavailable",
+                message: "A \(what) is being recorded. Stop it first, then start the meeting.",
+                coalescingKey: "capture.busy"
+            )
+        case .idle:
             runStartMeeting()
         }
     }
@@ -2393,17 +2987,17 @@ public final class AppRuntimeCoordinator {
                 self.notchHUD?.hide()
                 return
             }
-            await runtime.stop()
+            // Detached finalise: returns once capture is sealed (drain, notes
+            // flush, ended_at). The heavy tail — diarisation refinement, title,
+            // summary — keeps running with progress shown in the meeting view,
+            // and the summary/transcript-dependent post-processing fires from
+            // `onFinalizeComplete` (wired at runtime construction).
+            await runtime.stop(detachedFinalize: true)
             self.stopCoach()
             self.notchHUD?.hide()
+            // The list row appears immediately — ended_at is already written.
             await self.environment.state.meetingLibrary.refresh()
-            await self.runAutoCategorization()
-            await self.indexFinalizedMeeting()
-            // A finished meeting may have enrolled / refreshed voiceprints.
-            await self.refreshRememberedSpeakerCount()
-            Loggers.meeting.info("Meeting capture finalized")
-            // Keep retained recordings under the cache budget (BAS-44).
-            self.pruneAudioArchiveToBudget()
+            Loggers.meeting.info("Meeting capture sealed; finalise tail continues in background")
             // Re-arm a fresh detector for the next meeting (no-op when pref OFF).
             self.rearmMeetingAutoDetect()
         }
@@ -2417,10 +3011,15 @@ public final class AppRuntimeCoordinator {
     /// from the meetings library, which sets a sticky manual override (§8.3).
     /// Signals today are project-name + attendee overlap; the richer content /
     /// recurring / history signals are tracked in BAS-9.
-    private func runAutoCategorization() async {
+    private func runAutoCategorization(sessionId targetSessionId: String) async {
+        // Resolved by id, not `.first` — under detached finalise a NEW meeting
+        // may already be live (and at the top of the list) by the time the old
+        // one's tail completes.
         guard let repo = ensureLibraryRepository(),
             let projectStore = environment.projectStore,
-            let latest = environment.state.meetingLibrary.meetings.first,
+            let latest = environment.state.meetingLibrary.meetings.first(where: {
+                $0.sessionId == targetSessionId
+            }),
             latest.projectId == nil  // never re-file an already-filed meeting
         else { return }
         let projectRecords = (try? await projectStore.list()) ?? []
@@ -2464,17 +3063,46 @@ public final class AppRuntimeCoordinator {
         // The banner's one-tap buttons file the meeting (sticky manual override).
         liveModel.assignProjectFromSuggestion = { [weak self] projectID in
             guard let self, let repo = self.ensureLibraryRepository() else { return }
-            try? await repo.assignProject(sessionId: sessionId, projectId: projectID, manualOverride: true)
+            do {
+                try await repo.assignProject(sessionId: sessionId, projectId: projectID, manualOverride: true)
+            } catch {
+                Loggers.meeting.error(
+                    "Manual project assignment failed for \(sessionId, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                self.environment.notices.post(
+                    severity: .warning,
+                    title: "Meeting not filed",
+                    message:
+                        "The meeting could not be saved into the project — it stays in Inbox. Try filing it again from the meetings list.",
+                    coalescingKey: "meeting.assignProject"
+                )
+            }
             await self.environment.state.meetingLibrary.refresh()
         }
 
         switch result.bucket {
         case .autoAssign:
             guard let top = result.scores.first else { return }
-            try? await repo.assignProject(
-                sessionId: sessionId, projectId: top.project.id.uuidString,
-                manualOverride: false, confidence: top.confidence
-            )
+            do {
+                try await repo.assignProject(
+                    sessionId: sessionId, projectId: top.project.id.uuidString,
+                    manualOverride: false, confidence: top.confidence
+                )
+            } catch {
+                // Without this the meeting LOOKS auto-filed for the rest of the
+                // session, then quietly reappears in Inbox after relaunch.
+                Loggers.meeting.error(
+                    "Auto-categorization persist failed for \(sessionId, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+                environment.notices.post(
+                    severity: .warning,
+                    title: "Meeting not filed",
+                    message:
+                        "The meeting was matched to “\(top.project.name)” but the assignment could not be saved — it stays in Inbox. File it by hand from the meetings list.",
+                    coalescingKey: "meeting.assignProject"
+                )
+                return
+            }
             await environment.state.meetingLibrary.refresh()
             liveModel.setCategorization(Self.categorizationSuggestion(from: result, autoFiled: true))
             Loggers.meeting.info(
@@ -2554,6 +3182,19 @@ public final class AppRuntimeCoordinator {
             Loggers.bridges.info("Manual coach trigger ignored — no active meeting")
             return
         }
+        // Master-switch guard: with the coach off, the trigger used to pop the
+        // pill anyway and then produce nothing — a ghost. Refuse with directions.
+        guard environment.state.coachEnabled else {
+            Loggers.bridges.info("Manual coach trigger ignored — coach is switched off")
+            environment.notices.post(
+                severity: .info,
+                title: "Coach is switched off",
+                message: "Turn it on in Settings → Meeting coach to use the trigger.",
+                actions: [.openSettingsTab(.coachTriggers, label: "Open Settings → Meeting coach")],
+                coalescingKey: "coach.disabled"
+            )
+            return
+        }
         environment.state.coachOverlayVisible = true
         coachOverlay?.applyAppearance(environment.state.appearancePreference)
         coachOverlay?.present()
@@ -2568,8 +3209,21 @@ public final class AppRuntimeCoordinator {
                 speakerId: "you", text: window, timestamp: Date(),
                 userRequested: true, intent: intent
             )
-            if let result = try? await orchestrator.ingest(utterance: cu, windowText: window) {
-                self?.applyCoachResult(result)
+            do {
+                // Manual cues bypass the concurrency cap and are never superseded.
+                let result = try await orchestrator.enqueue(utterance: cu, windowText: window)
+                if let result { self?.applyCoachResult(result) }
+            } catch {
+                // The user explicitly asked — a silent nothing is not acceptable.
+                Loggers.bridges.warning(
+                    "Manual coach trigger failed: \(error.localizedDescription, privacy: .public)")
+                self?.environment.notices.post(
+                    severity: .warning,
+                    title: "Coach could not answer",
+                    message: "The coach's model did not respond. Check its routing in Settings.",
+                    actions: [.openSettingsTab(.coachTriggers, label: "Open Settings → Meeting coach")],
+                    coalescingKey: "coach.manual"
+                )
             }
         }
     }

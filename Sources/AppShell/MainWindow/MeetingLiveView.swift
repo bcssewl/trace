@@ -23,12 +23,15 @@ struct MeetingLiveView: View {
     @State private var renameText = ""
 
     var body: some View {
-        HStack(spacing: 0) {
-            transcriptColumn
-            columnDivider
-            notesColumn
-            columnDivider
-            summaryColumn
+        VStack(spacing: 0) {
+            storageNoticeStrip
+            HStack(spacing: 0) {
+                transcriptColumn
+                columnDivider
+                notesColumn
+                columnDivider
+                summaryColumn
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(palette.background.color)
@@ -38,6 +41,27 @@ struct MeetingLiveView: View {
                 set: { if !$0 { renamingSpeakerID = nil } }
             )
         ) { renameSpeakerSheet }
+    }
+
+    /// Loud persistence failures (transcript lines, notes, summary, session
+    /// record) surfaced as dismissable warning banners across the whole view —
+    /// a disk problem is never log-only.
+    @ViewBuilder
+    private var storageNoticeStrip: some View {
+        if !model.storageNotices.isEmpty {
+            VStack(spacing: BrutalistMetrics.space1) {
+                ForEach(model.storageNotices, id: \.self) { notice in
+                    BrutalistBanner(
+                        kind: .warning,
+                        title: notice,
+                        actionTitle: "Dismiss",
+                        action: { model.dismissStorageNotice(notice) }
+                    )
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+        }
     }
 
     // MARK: Speaker rename (BAS-11)
@@ -150,6 +174,10 @@ struct MeetingLiveView: View {
         if let notice = model.engineNotice {
             BrutalistStatusChip(notice, tint: semantic.info.color)
         }
+        if let capture = model.captureNotice {
+            BrutalistStatusChip("Only recording you", tint: semantic.warning.color)
+                .help(capture)
+        }
     }
 
     private func turnRow(_ turn: MeetingLiveModel.Turn) -> some View {
@@ -235,12 +263,17 @@ struct MeetingLiveView: View {
             if showSteer { steerField }
             ScrollView {
                 VStack(alignment: .leading, spacing: 10) {
-                    if model.liveSummary.isEmpty {
+                    if case .failed(let message) = model.summaryPhase {
+                        summaryFailureView(message)
+                    } else if showMissingSummaryAffordance {
+                        missingSummaryView
+                    } else if model.liveSummary.isEmpty {
                         Text(summaryPlaceholder)
                             .font(BrutalistTypography.body)
                             .foregroundStyle(palette.fgMuted.color)
                             .padding(.top, 24)
-                    } else {
+                    }
+                    if !model.liveSummary.isEmpty {
                         BrutalistMarkdownView(markdown: model.liveSummary)
                     }
                 }
@@ -249,6 +282,54 @@ struct MeetingLiveView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// A failed generation is never a silent ghost state: the message is shown
+    /// in full with a one-tap retry (which cancels nothing the user wants —
+    /// regeneration replaces, never stacks).
+    private func summaryFailureView(_ message: String) -> some View {
+        VStack(alignment: .leading, spacing: BrutalistMetrics.space2) {
+            BrutalistBanner(
+                kind: .warning,
+                title: "The summary couldn't be generated",
+                detail: message
+            )
+            if model.canRegenerate {
+                BrutalistButton(
+                    model.isRegenerating ? "Trying again…" : "Try again",
+                    kind: .primary, size: .compact
+                ) {
+                    Task { await model.regenerate() }
+                }
+                .disabled(model.isRegenerating)
+            }
+        }
+    }
+
+    /// A meeting with a transcript but no summary (e.g. closed after a crash and
+    /// reconciled at boot) gets a clear way to generate one — never an
+    /// unexplained empty pane.
+    private var showMissingSummaryAffordance: Bool {
+        model.canRegenerate
+            && model.liveSummary.isEmpty
+            && model.summaryPhase == .idle
+            && model.summaryState == .none
+            && !model.isRegenerating
+            && !model.turns.isEmpty
+    }
+
+    private var missingSummaryView: some View {
+        VStack(alignment: .leading, spacing: BrutalistMetrics.space2) {
+            BrutalistBanner(
+                kind: .info,
+                title: "Summary missing",
+                detail:
+                    "This meeting has a transcript but no summary — it may have ended unexpectedly before one was written."
+            )
+            BrutalistButton("Generate now", kind: .primary, size: .compact) {
+                Task { await model.regenerate() }
+            }
+        }
     }
 
     /// Post-finalize auto-categorization prompt (BAS-9): confirms a high-confidence
@@ -312,16 +393,32 @@ struct MeetingLiveView: View {
         )
     }
 
+    /// Finalisation progress takes priority (so a stopped meeting clearly shows
+    /// "Finalising… / Generating summary…" instead of feeling stuck); outside a
+    /// finalisation the original text-stream chips render unchanged.
     @ViewBuilder
     private var summaryStatus: some View {
         let semantic = BrutalistPalette.semantic(scheme)
-        switch model.summaryState {
-        case .none:
-            EmptyView()
-        case .streaming:
-            BrutalistStatusChip("Writing…", tint: semantic.info.color)
-        case .final:
+        switch model.summaryPhase {
+        case .preparing:
+            ProgressView().controlSize(.small)
+            BrutalistStatusChip("Finalising transcript…", tint: semantic.info.color)
+        case .generating:
+            ProgressView().controlSize(.small)
+            BrutalistStatusChip("Generating summary…", tint: semantic.info.color)
+        case .failed:
+            BrutalistStatusChip("Failed", tint: semantic.warning.color)
+        case .done:
             BrutalistStatusChip("Done", tint: semantic.success.color)
+        case .idle:
+            switch model.summaryState {
+            case .none:
+                EmptyView()
+            case .streaming:
+                BrutalistStatusChip("Writing…", tint: semantic.info.color)
+            case .final:
+                BrutalistStatusChip("Done", tint: semantic.success.color)
+            }
         }
     }
 
@@ -355,9 +452,16 @@ struct MeetingLiveView: View {
     }
 
     private var summaryPlaceholder: String {
-        model.summaryState == .none
-            ? "A rolling summary appears here during the meeting; the full structured note is generated when you stop."
-            : "Summarising…"
+        switch model.summaryPhase {
+        case .preparing:
+            return "Meeting ended — finalising the transcript before writing the summary…"
+        case .generating:
+            return "Summarising…"
+        default:
+            return model.summaryState == .none
+                ? "A rolling summary appears here during the meeting; the full structured note is generated when you stop."
+                : "Summarising…"
+        }
     }
 
     // MARK: Shared

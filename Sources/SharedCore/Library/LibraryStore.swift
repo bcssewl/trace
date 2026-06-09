@@ -56,25 +56,38 @@ public actor LibraryStore {
     }
 
     public func recentItems(limit: Int) async throws -> [LibraryItem] {
+        // Each UNION branch is pre-sorted and pre-limited (the per-table
+        // started_at indexes make that a cheap top-N) so the outer sort works on
+        // at most 4×limit rows instead of every row of every table.
         let sql = """
             SELECT id, project_id, title, started_at, src FROM (
-              SELECT id, project_id, title, started_at, 'meeting' AS src FROM meetings
+              SELECT * FROM (
+                SELECT id, project_id, title, started_at, 'meeting' AS src FROM meetings
+                ORDER BY started_at DESC LIMIT ?)
               UNION ALL
-              SELECT id, project_id,
-                     COALESCE(NULLIF(SUBSTR(COALESCE(cleaned_text, raw_text, ''), 1, 80), ''), 'Untitled dictation') AS title,
-                     started_at, 'dictation' AS src FROM dictations
+              SELECT * FROM (
+                SELECT id, project_id,
+                       COALESCE(NULLIF(SUBSTR(COALESCE(cleaned_text, raw_text, ''), 1, 80), ''), 'Untitled dictation') AS title,
+                       started_at, 'dictation' AS src FROM dictations
+                ORDER BY started_at DESC LIMIT ?)
               UNION ALL
-              SELECT id, project_id,
-                     COALESCE(title, source_path, 'Untitled file') AS title,
-                     created_at AS started_at, 'file' AS src FROM files
+              SELECT * FROM (
+                SELECT id, project_id,
+                       COALESCE(title, source_path, 'Untitled file') AS title,
+                       created_at AS started_at, 'file' AS src FROM files
+                ORDER BY started_at DESC LIMIT ?)
               UNION ALL
-              SELECT id, project_id,
-                     COALESCE(title, 'Voice memo') AS title,
-                     started_at, 'voiceMemo' AS src FROM voice_memos
+              SELECT * FROM (
+                SELECT id, project_id,
+                       COALESCE(title, 'Voice memo') AS title,
+                       started_at, 'voiceMemo' AS src FROM voice_memos
+                ORDER BY started_at DESC LIMIT ?)
             ) ORDER BY started_at DESC LIMIT ?
             """
         let raw = try await db.withStatement(sql: sql) { stmt -> [(String, String?, String, Int64, String)] in
-            try stmt.bind(int: limit, at: 1)
+            for index in Int32(1)...5 {
+                try stmt.bind(int: limit, at: index)
+            }
             var rows: [(String, String?, String, Int64, String)] = []
             while try stmt.step() == .row {
                 guard let id = stmt.columnText(at: 0),
@@ -118,7 +131,7 @@ public actor LibraryStore {
                       JOIN meetings AS m ON m.id = t.meeting_id
                      WHERE transcript_fts MATCH ? ORDER BY rank LIMIT ?
                     """,
-                match: match, limit: limit
+                textBinds: [match], limit: limit
             ) { stmt in
                 guard let meetingId = stmt.columnText(at: 0), let text = stmt.columnText(at: 2) else { return nil }
                 let timestamp = stmt.columnDouble(at: 3)
@@ -144,7 +157,7 @@ public actor LibraryStore {
                       JOIN meetings AS m ON m.id = n.meeting_id
                      WHERE notes_fts MATCH ? ORDER BY rank LIMIT ?
                     """,
-                match: match, limit: limit
+                textBinds: [match], limit: limit
             ) { stmt in
                 guard let meetingId = stmt.columnText(at: 0), let text = stmt.columnText(at: 1) else { return nil }
                 return KeywordHit(
@@ -177,16 +190,13 @@ public actor LibraryStore {
     private func entryKeywordHits(
         match: String, source: LibraryItem.Source, limit: Int
     ) async throws -> [KeywordHit] {
-        // `source.rawValue` is a controlled enum constant (not user input), so
-        // inlining it keeps the bind shape at (match, limit) — letting this reuse
-        // `ftsKeywordHits`'s bind/step/loop instead of duplicating it.
         try await ftsKeywordHits(
             sql: """
                 SELECT item_id, project_id, title, started_at, snippet(entry_fts, 6, '', '', '…', 18)
                   FROM entry_fts
-                 WHERE entry_fts MATCH ? AND source = '\(source.rawValue)' ORDER BY rank LIMIT ?
+                 WHERE entry_fts MATCH ? AND source = ? ORDER BY rank LIMIT ?
                 """,
-            match: match, limit: limit
+            textBinds: [match, source.rawValue], limit: limit
         ) { stmt in
             guard let itemId = stmt.columnText(at: 0) else { return nil }
             return KeywordHit(
@@ -209,17 +219,22 @@ public actor LibraryStore {
         }
     }
 
-    /// Runs an FTS5 `MATCH ? … LIMIT ?` query and collects the rows `decode`
+    /// Runs an FTS5 `… ? … LIMIT ?` query and collects the rows `decode`
     /// returns (nil drops a row — used for the in-Swift scope filter).
     ///
-    /// Owns the
-    /// bind/step/loop boilerplate shared by the transcript + notes arms.
+    /// `textBinds` are bound in order from index 1 (the MATCH expression first,
+    /// plus any extra bound predicates like `entry_fts.source`); `limit` is
+    /// always the final placeholder. Owns the bind/step/loop boilerplate shared
+    /// by the transcript / notes / entry arms.
     private func ftsKeywordHits(
-        sql: String, match: String, limit: Int, decode: @Sendable (SqliteStatement) -> KeywordHit?
+        sql: String, textBinds: [String], limit: Int,
+        decode: @Sendable (SqliteStatement) -> KeywordHit?
     ) async throws -> [KeywordHit] {
         try await db.withStatement(sql: sql) { stmt in
-            try stmt.bind(text: match, at: 1)
-            try stmt.bind(int: limit, at: 2)
+            for (offset, value) in textBinds.enumerated() {
+                try stmt.bind(text: value, at: Int32(offset + 1))
+            }
+            try stmt.bind(int: limit, at: Int32(textBinds.count + 1))
             var hits: [KeywordHit] = []
             while try stmt.step() == .row {
                 if let hit = decode(stmt) { hits.append(hit) }

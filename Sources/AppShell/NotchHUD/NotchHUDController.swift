@@ -187,6 +187,12 @@ public enum NotchKind: Sendable, Hashable {
     case failed  // dictation finalize failed
     case downloadFailed  // model download failed
     case unavailable  // dictation runtime couldn't be built
+    case micUnavailable  // mic permission missing / device gone — start failed
+    case modelMissing  // speech model not on disk — start failed
+    case secureField  // focused element is a password field — insert refused
+    case cancelled  // user cancelled the recording (Esc) — nothing inserted
+    case stillFinishing  // new start queued behind the previous cycle's tail
+    case recoveryAvailable(Int)  // crashed-session dictations await recovery
 
     /// The hump behavior for this kind.
     ///
@@ -196,9 +202,10 @@ public enum NotchKind: Sendable, Hashable {
         switch self {
         case .listening, .meeting, .voiceMemo:
             return .listening
-        case .preparing, .downloading, .transcribing, .cleaning:
+        case .preparing, .downloading, .transcribing, .cleaning, .stillFinishing:
             return .transcribing
-        case .inserted, .copied, .noAudio, .failed, .downloadFailed, .unavailable:
+        case .inserted, .copied, .noAudio, .failed, .downloadFailed, .unavailable,
+            .micUnavailable, .modelMissing, .secureField, .cancelled, .recoveryAvailable:
             return .inserting
         }
     }
@@ -224,6 +231,15 @@ public enum NotchKind: Sendable, Hashable {
         case .failed: return "Something went wrong"
         case .downloadFailed: return "Couldn't download — try again"
         case .unavailable: return "Dictation isn't ready"
+        case .micUnavailable: return "Microphone unavailable"
+        case .modelMissing: return "Model not downloaded — open Settings"
+        case .secureField: return "Secure field — text not inserted"
+        case .cancelled: return "Cancelled"
+        case .stillFinishing: return "Still finishing the previous dictation"
+        case .recoveryAvailable(let count):
+            return count == 1
+                ? "Recovered an unsaved dictation — see History"
+                : "Recovered \(count) unsaved dictations — see History"
         }
     }
 

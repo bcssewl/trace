@@ -591,6 +591,8 @@ struct OnboardingSpeechView: View {
     private func selectEngine(_ engine: OnboardingStateModel.SpeechEngine) {
         // Synchronous state mutation in the action — executor bug.
         state.speechEngine = engine
+        // An explicit choice supersedes any earlier deferred take-over.
+        appState.parakeetTakeoverPending = false
         switch engine {
         case .parakeet:
             appState.dictationASREngine = .parakeet
@@ -1188,8 +1190,14 @@ struct OnboardingTryView: View {
         }
         .task {
             await install.probeReadiness()
-            // Ensure the dictation runtime uses an engine that's ready right now.
-            if usingFallback { appState.dictationASREngine = .appleSpeech }
+            // Ensure the dictation runtime uses an engine that's ready right
+            // now — and record the promise the copy above makes: Parakeet takes
+            // over automatically the moment its download lands (the flag also
+            // resumes the download at next launch if the app quits first).
+            if usingFallback {
+                appState.dictationASREngine = .appleSpeech
+                appState.parakeetTakeoverPending = true
+            }
         }
         .onAppear { fieldFocused = true }
     }

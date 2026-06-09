@@ -701,6 +701,7 @@ private struct CoachTriggersBody: View {
     @State private var availability: DictationAvailability = .unknown
     @State private var connectedProviders: Set<ModelProvider> = []
     @State private var ollamaModels: [String] = []
+    @State private var showAdvanced = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -872,6 +873,7 @@ private struct CoachTriggersBody: View {
                     }
                 }
             }
+            advancedDisclosure
             HStack {
                 Spacer()
                 BrutalistButton("Reset coach to defaults", kind: .ghost) {
@@ -889,6 +891,61 @@ private struct CoachTriggersBody: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .traceProvidersChanged)) { _ in
             connectedProviders = ModelProvider.routingConnectedSet()
+        }
+    }
+
+    /// Collapsed power-user knobs, per the Advanced-section convention.
+    @ViewBuilder
+    private var advancedDisclosure: some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.18)) { showAdvanced.toggle() }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: showAdvanced ? "chevron.down" : "chevron.right")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(palette.fgMuted.color)
+                Text("Advanced")
+                    .font(BrutalistTypography.labelEmphasis)
+                    .foregroundStyle(palette.fg.color)
+                Spacer()
+            }
+            .padding(.horizontal, 36)
+            .padding(.top, 24)
+            .padding(.bottom, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if showAdvanced {
+            SettingsGroup("Load") {
+                SettingsRow(
+                    key: "Cues analysed at once",
+                    hint:
+                        "How many things the coach thinks about simultaneously. When the conversation outpaces this, it skips to the newest remark (and says how many it skipped). Raise it only if your model is fast and you see skips often.",
+                    showDivider: false
+                ) {
+                    HStack(spacing: 8) {
+                        ForEach([1, 2, 3, 4], id: \.self) { n in
+                            Text("\(n)")
+                                .font(BrutalistTypography.mono11)
+                                .foregroundStyle(
+                                    state.coachConfig.maxConcurrentIngests == n
+                                        ? palette.primary.color : palette.fg.color
+                                )
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .overlay(
+                                    Rectangle().stroke(
+                                        state.coachConfig.maxConcurrentIngests == n
+                                            ? palette.primary.color : palette.border.color,
+                                        lineWidth: BrutalistMetrics.hairline
+                                    )
+                                )
+                                .onTapGesture { state.coachConfig.maxConcurrentIngests = n }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1039,6 +1096,9 @@ public struct ASREnginesSettingsView: View {
     /// and the set of providers that already have a key in the Keychain (BAS-21).
     @State private var cloudKeyDrafts: [String: String] = [:]
     @State private var cloudKeysPresent: Set<String> = []
+    /// Per-provider Keychain failure message — a failed save/clear must never
+    /// look like it worked.
+    @State private var cloudKeyErrors: [String: String] = [:]
     var state: AppStateModel?
 
     public init(state: AppStateModel? = nil) {
@@ -1285,6 +1345,8 @@ public struct ASREnginesSettingsView: View {
     /// and align the coarse engine so the runtime builds the exact backend.
     private func select(_ entry: ASRModelEntry) {
         guard let state else { return }
+        // An explicit choice supersedes onboarding's deferred Parakeet take-over.
+        state.parakeetTakeoverPending = false
         state.dictationLocalModelID = entry.id
         state.dictationASREngine = entry.engine.coarseDictationEngine
     }
@@ -1408,6 +1470,12 @@ public struct ASREnginesSettingsView: View {
                 .textFieldStyle(.plain)
                 .font(BrutalistTypography.mono10)
                 .frame(maxWidth: 320)
+                if let keyError = cloudKeyErrors[provider.rawValue] {
+                    Text(keyError)
+                        .font(BrutalistTypography.caption)
+                        .foregroundStyle(palette.primary.color)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             Spacer()
             VStack(alignment: .trailing, spacing: 6) {
@@ -1416,6 +1484,8 @@ public struct ASREnginesSettingsView: View {
                     BrutalistButton("Clear", kind: .ghost) { clearCloudKey(provider) }
                     if !isActive {
                         BrutalistButton("Use for dictation", kind: .ghost) {
+                            // Explicit choice supersedes the deferred take-over.
+                            state?.parakeetTakeoverPending = false
                             state?.dictationCloudProvider = provider
                             state?.dictationASREngine = .cloud
                         }
@@ -1435,7 +1505,16 @@ public struct ASREnginesSettingsView: View {
         let draft = (cloudKeyDrafts[provider.rawValue] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !draft.isEmpty else { return }
         let account = CloudASRBackend.endpoints(for: provider).keychainAccount
-        try? KeychainSecrets().save(account: account, value: draft)
+        do {
+            try KeychainSecrets().save(account: account, value: draft)
+        } catch {
+            // A swallowed failure here showed "Key added" for a key that was
+            // never stored — transcription would then fail with no explanation.
+            cloudKeyErrors[provider.rawValue] =
+                "The key could not be saved to the Keychain (\(error.localizedDescription)). Try again."
+            return
+        }
+        cloudKeyErrors[provider.rawValue] = nil
         cloudKeysPresent.insert(provider.rawValue)
         cloudKeyDrafts[provider.rawValue] = ""
         // Tell other open settings views (e.g. the Meetings cloud picker) to
@@ -1445,7 +1524,14 @@ public struct ASREnginesSettingsView: View {
 
     private func clearCloudKey(_ provider: CloudASRProvider) {
         let account = CloudASRBackend.endpoints(for: provider).keychainAccount
-        try? KeychainSecrets().delete(account: account)
+        do {
+            try KeychainSecrets().delete(account: account)
+        } catch {
+            cloudKeyErrors[provider.rawValue] =
+                "The key could not be removed from the Keychain (\(error.localizedDescription)). Try again."
+            return
+        }
+        cloudKeyErrors[provider.rawValue] = nil
         cloudKeysPresent.remove(provider.rawValue)
         // If this was the active dictation engine, fall back to the local default
         // so we never leave dictation pointed at a now-keyless cloud provider.

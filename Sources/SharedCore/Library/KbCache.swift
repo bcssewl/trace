@@ -44,34 +44,38 @@ public actor KbCache {
                  source_kind, project_id, meeting_id, speaker, ts_seconds, title, started_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
-        try await db.withStatement(sql: chunkSql) { stmt in
-            try stmt.bind(text: chunk.id, at: 1)
-            try stmt.bind(text: chunk.sourceFile, at: 2)
-            try stmt.bind(text: chunk.breadcrumb, at: 3)
-            try stmt.bind(text: chunk.text, at: 4)
-            try stmt.bind(text: chunk.sourceSha256, at: 5)
-            try stmt.bind(int64: Int64(Date().timeIntervalSince1970), at: 6)
-            try stmt.bind(text: chunk.sourceKind.rawValue, at: 7)
-            try stmt.bind(optionalText: chunk.projectId, at: 8)
-            try stmt.bind(optionalText: chunk.meetingId, at: 9)
-            try stmt.bind(optionalText: chunk.speaker, at: 10)
-            try stmt.bind(optionalDouble: chunk.tsSeconds, at: 11)
-            try stmt.bind(optionalText: chunk.title, at: 12)
-            try stmt.bind(optionalInt64: chunk.startedAt.map { Int64($0.timeIntervalSince1970) }, at: 13)
-            _ = try stmt.step()
-        }
         let embSql = """
             INSERT OR REPLACE INTO kb_embeddings
                 (chunk_id, vector, config_fingerprint, dim)
             VALUES (?, ?, ?, ?)
             """
         let blob = Self.encode(vector: embedding.vector)
-        try await db.withStatement(sql: embSql) { stmt in
-            try stmt.bind(text: embedding.chunkId, at: 1)
-            try stmt.bind(data: blob, at: 2)
-            try stmt.bind(text: embedding.configFingerprint, at: 3)
-            try stmt.bind(int64: Int64(embedding.vector.count), at: 4)
-            _ = try stmt.step()
+        // One transaction: a chunk without its embedding (or vice versa) is an
+        // index inconsistency the reconciler would otherwise have to clean up.
+        try await db.transaction {
+            try await db.withStatement(sql: chunkSql) { stmt in
+                try stmt.bind(text: chunk.id, at: 1)
+                try stmt.bind(text: chunk.sourceFile, at: 2)
+                try stmt.bind(text: chunk.breadcrumb, at: 3)
+                try stmt.bind(text: chunk.text, at: 4)
+                try stmt.bind(text: chunk.sourceSha256, at: 5)
+                try stmt.bind(int64: Int64(Date().timeIntervalSince1970), at: 6)
+                try stmt.bind(text: chunk.sourceKind.rawValue, at: 7)
+                try stmt.bind(optionalText: chunk.projectId, at: 8)
+                try stmt.bind(optionalText: chunk.meetingId, at: 9)
+                try stmt.bind(optionalText: chunk.speaker, at: 10)
+                try stmt.bind(optionalDouble: chunk.tsSeconds, at: 11)
+                try stmt.bind(optionalText: chunk.title, at: 12)
+                try stmt.bind(optionalInt64: chunk.startedAt.map { Int64($0.timeIntervalSince1970) }, at: 13)
+                _ = try stmt.step()
+            }
+            try await db.withStatement(sql: embSql) { stmt in
+                try stmt.bind(text: embedding.chunkId, at: 1)
+                try stmt.bind(data: blob, at: 2)
+                try stmt.bind(text: embedding.configFingerprint, at: 3)
+                try stmt.bind(int64: Int64(embedding.vector.count), at: 4)
+                _ = try stmt.step()
+            }
         }
     }
 
@@ -86,50 +90,56 @@ public actor KbCache {
     public func pruneObsolete(keeping: [(file: String, sha: String)]) async throws {
         let playbookKind = KbChunk.SourceKind.playbook.rawValue
         guard !keeping.isEmpty else {
+            // Transactional: a crash between the two deletes used to orphan
+            // chunk rows (embedding gone, chunk left) or vice versa.
+            try await db.transaction {
+                try await db.withStatement(
+                    sql: "DELETE FROM kb_embeddings WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_kind = ?)"
+                ) { stmt in
+                    try stmt.bind(text: playbookKind, at: 1)
+                    _ = try stmt.step()
+                }
+                try await db.withStatement(sql: "DELETE FROM kb_chunks WHERE source_kind = ?") { stmt in
+                    try stmt.bind(text: playbookKind, at: 1)
+                    _ = try stmt.step()
+                }
+            }
+            return
+        }
+        try await db.transaction {
+            try await db.exec(sql: "CREATE TEMP TABLE IF NOT EXISTS _keep (f TEXT, s TEXT)")
+            try await db.exec(sql: "DELETE FROM _keep")
+            for entry in keeping {
+                try await db.withStatement(sql: "INSERT INTO _keep VALUES (?, ?)") { stmt in
+                    try stmt.bind(text: entry.file, at: 1)
+                    try stmt.bind(text: entry.sha, at: 2)
+                    _ = try stmt.step()
+                }
+            }
             try await db.withStatement(
-                sql: "DELETE FROM kb_embeddings WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE source_kind = ?)"
+                sql: """
+                    DELETE FROM kb_embeddings WHERE chunk_id IN (
+                      SELECT c.id FROM kb_chunks AS c
+                      LEFT JOIN _keep AS k ON k.f = c.source_file AND k.s = c.source_sha256
+                      WHERE k.f IS NULL AND c.source_kind = ?
+                    )
+                    """
             ) { stmt in
                 try stmt.bind(text: playbookKind, at: 1)
                 _ = try stmt.step()
             }
-            try await db.withStatement(sql: "DELETE FROM kb_chunks WHERE source_kind = ?") { stmt in
+            try await db.withStatement(
+                sql: """
+                    DELETE FROM kb_chunks WHERE id IN (
+                      SELECT c.id FROM kb_chunks AS c
+                      LEFT JOIN _keep AS k ON k.f = c.source_file AND k.s = c.source_sha256
+                      WHERE k.f IS NULL AND c.source_kind = ?
+                    )
+                    """
+            ) { stmt in
                 try stmt.bind(text: playbookKind, at: 1)
                 _ = try stmt.step()
             }
-            return
-        }
-        try await db.exec(sql: "CREATE TEMP TABLE IF NOT EXISTS _keep (f TEXT, s TEXT)")
-        try await db.exec(sql: "DELETE FROM _keep")
-        for entry in keeping {
-            try await db.withStatement(sql: "INSERT INTO _keep VALUES (?, ?)") { stmt in
-                try stmt.bind(text: entry.file, at: 1)
-                try stmt.bind(text: entry.sha, at: 2)
-                _ = try stmt.step()
-            }
-        }
-        try await db.withStatement(
-            sql: """
-                DELETE FROM kb_embeddings WHERE chunk_id IN (
-                  SELECT c.id FROM kb_chunks AS c
-                  LEFT JOIN _keep AS k ON k.f = c.source_file AND k.s = c.source_sha256
-                  WHERE k.f IS NULL AND c.source_kind = ?
-                )
-                """
-        ) { stmt in
-            try stmt.bind(text: playbookKind, at: 1)
-            _ = try stmt.step()
-        }
-        try await db.withStatement(
-            sql: """
-                DELETE FROM kb_chunks WHERE id IN (
-                  SELECT c.id FROM kb_chunks AS c
-                  LEFT JOIN _keep AS k ON k.f = c.source_file AND k.s = c.source_sha256
-                  WHERE k.f IS NULL AND c.source_kind = ?
-                )
-                """
-        ) { stmt in
-            try stmt.bind(text: playbookKind, at: 1)
-            _ = try stmt.step()
         }
     }
 
@@ -163,12 +173,44 @@ public actor KbCache {
         }
     }
 
+    /// The shared chunk+embedding column list — keep `decodeChunkRow` in sync.
+    private static let chunkSelectColumns = """
+        c.id, c.source_file, c.breadcrumb, c.text, c.source_sha256,
+               e.vector, e.config_fingerprint,
+               c.source_kind, c.project_id, c.meeting_id, c.speaker,
+               c.ts_seconds, c.title, c.started_at
+        """
+
+    private static func decodeChunkRow(_ stmt: SqliteStatement) -> (KbChunk, KbEmbedding)? {
+        guard
+            let id = stmt.columnText(at: 0),
+            let file = stmt.columnText(at: 1),
+            let crumb = stmt.columnText(at: 2),
+            let text = stmt.columnText(at: 3),
+            let sha = stmt.columnText(at: 4),
+            let fingerprint = stmt.columnText(at: 6)
+        else { return nil }
+        let blob = stmt.columnBlob(at: 5)
+        let vec = Self.decode(blob: blob)
+        let kind = KbChunk.SourceKind(rawValue: stmt.columnText(at: 7) ?? "playbook") ?? .playbook
+        let startedAt = stmt.columnOptionalInt64(at: 13)
+            .map { Date(timeIntervalSince1970: TimeInterval($0)) }
+        let chunk = KbChunk(
+            id: id, sourceFile: file, breadcrumb: crumb, text: text, sourceSha256: sha,
+            sourceKind: kind,
+            projectId: stmt.columnText(at: 8),
+            meetingId: stmt.columnText(at: 9),
+            speaker: stmt.columnText(at: 10),
+            tsSeconds: stmt.columnOptionalDouble(at: 11),
+            title: stmt.columnText(at: 12),
+            startedAt: startedAt
+        )
+        return (chunk, KbEmbedding(chunkId: id, vector: vec, configFingerprint: fingerprint))
+    }
+
     public func loadValid(config: EmbeddingConfig) async throws -> [(KbChunk, KbEmbedding)] {
         let sql = """
-            SELECT c.id, c.source_file, c.breadcrumb, c.text, c.source_sha256,
-                   e.vector, e.config_fingerprint,
-                   c.source_kind, c.project_id, c.meeting_id, c.speaker,
-                   c.ts_seconds, c.title, c.started_at
+            SELECT \(Self.chunkSelectColumns)
               FROM kb_chunks AS c
               JOIN kb_embeddings AS e ON e.chunk_id = c.id
              WHERE e.config_fingerprint = ?
@@ -177,33 +219,68 @@ public actor KbCache {
             try stmt.bind(text: config.fingerprint, at: 1)
             var out: [(KbChunk, KbEmbedding)] = []
             while try stmt.step() == .row {
-                guard
-                    let id = stmt.columnText(at: 0),
-                    let file = stmt.columnText(at: 1),
-                    let crumb = stmt.columnText(at: 2),
-                    let text = stmt.columnText(at: 3),
-                    let sha = stmt.columnText(at: 4),
-                    let fingerprint = stmt.columnText(at: 6)
-                else { continue }
-                let blob = stmt.columnBlob(at: 5)
-                let vec = Self.decode(blob: blob)
-                let kind = KbChunk.SourceKind(rawValue: stmt.columnText(at: 7) ?? "playbook") ?? .playbook
-                let startedAt = stmt.columnOptionalInt64(at: 13)
-                    .map { Date(timeIntervalSince1970: TimeInterval($0)) }
-                let chunk = KbChunk(
-                    id: id, sourceFile: file, breadcrumb: crumb, text: text, sourceSha256: sha,
-                    sourceKind: kind,
-                    projectId: stmt.columnText(at: 8),
-                    meetingId: stmt.columnText(at: 9),
-                    speaker: stmt.columnText(at: 10),
-                    tsSeconds: stmt.columnOptionalDouble(at: 11),
-                    title: stmt.columnText(at: 12),
-                    startedAt: startedAt
-                )
-                out.append((chunk, KbEmbedding(chunkId: id, vector: vec, configFingerprint: fingerprint)))
+                if let row = Self.decodeChunkRow(stmt) { out.append(row) }
             }
             return out
         }
+    }
+
+    /// Lightweight change-detection map for `VectorSearch`'s incremental
+    /// refresh: chunk id → `created_at` for every chunk embedded at `config`'s
+    /// fingerprint.
+    ///
+    /// `created_at` is rewritten on every (re-)upsert, so it
+    /// doubles as a version stamp; no vectors or text are read.
+    public func chunkVersions(config: EmbeddingConfig) async throws -> [String: Int64] {
+        let sql = """
+            SELECT c.id, c.created_at
+              FROM kb_chunks AS c
+              JOIN kb_embeddings AS e ON e.chunk_id = c.id
+             WHERE e.config_fingerprint = ?
+            """
+        return try await db.withStatement(sql: sql) { stmt in
+            try stmt.bind(text: config.fingerprint, at: 1)
+            var out: [String: Int64] = [:]
+            while try stmt.step() == .row {
+                if let id = stmt.columnText(at: 0) { out[id] = stmt.columnInt64(at: 1) }
+            }
+            return out
+        }
+    }
+
+    /// Load only the given chunk ids (with their embeddings) at `config`'s
+    /// fingerprint — the data half of `VectorSearch`'s incremental refresh.
+    public func loadChunks(ids: [String], config: EmbeddingConfig) async throws -> [(KbChunk, KbEmbedding)] {
+        guard !ids.isEmpty else { return [] }
+        var out: [(KbChunk, KbEmbedding)] = []
+        out.reserveCapacity(ids.count)
+        // Batch the IN clause to stay well under SQLite's bind-parameter limit.
+        let batchSize = 400
+        var start = 0
+        while start < ids.count {
+            let batch = Array(ids[start..<min(start + batchSize, ids.count)])
+            start += batchSize
+            let placeholders = batch.map { _ in "?" }.joined(separator: ", ")
+            let sql = """
+                SELECT \(Self.chunkSelectColumns)
+                  FROM kb_chunks AS c
+                  JOIN kb_embeddings AS e ON e.chunk_id = c.id
+                 WHERE e.config_fingerprint = ? AND c.id IN (\(placeholders))
+                """
+            let rows = try await db.withStatement(sql: sql) { stmt -> [(KbChunk, KbEmbedding)] in
+                try stmt.bind(text: config.fingerprint, at: 1)
+                for (offset, id) in batch.enumerated() {
+                    try stmt.bind(text: id, at: Int32(offset + 2))
+                }
+                var rows: [(KbChunk, KbEmbedding)] = []
+                while try stmt.step() == .row {
+                    if let row = Self.decodeChunkRow(stmt) { rows.append(row) }
+                }
+                return rows
+            }
+            out += rows
+        }
+        return out
     }
 
     /// Delete every chunk + embedding for one meeting.
@@ -215,15 +292,17 @@ public actor KbCache {
     /// but we delete it explicitly too so the purge is correct regardless of the
     /// `foreign_keys` pragma state.
     public func deleteByMeeting(meetingId: String) async throws {
-        try await db.withStatement(
-            sql: "DELETE FROM kb_embeddings WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE meeting_id = ?)"
-        ) { stmt in
-            try stmt.bind(text: meetingId, at: 1)
-            _ = try stmt.step()
-        }
-        try await db.withStatement(sql: "DELETE FROM kb_chunks WHERE meeting_id = ?") { stmt in
-            try stmt.bind(text: meetingId, at: 1)
-            _ = try stmt.step()
+        try await db.transaction {
+            try await db.withStatement(
+                sql: "DELETE FROM kb_embeddings WHERE chunk_id IN (SELECT id FROM kb_chunks WHERE meeting_id = ?)"
+            ) { stmt in
+                try stmt.bind(text: meetingId, at: 1)
+                _ = try stmt.step()
+            }
+            try await db.withStatement(sql: "DELETE FROM kb_chunks WHERE meeting_id = ?") { stmt in
+                try stmt.bind(text: meetingId, at: 1)
+                _ = try stmt.step()
+            }
         }
     }
 
@@ -235,23 +314,25 @@ public actor KbCache {
     /// (BAS-28). `kb_embeddings` cascades via FK; deleted explicitly too so the
     /// purge is correct regardless of the `foreign_keys` pragma state.
     public func deleteByMeetingSource(meetingId: String, sourceFile: String) async throws {
-        try await db.withStatement(
-            sql: """
-                DELETE FROM kb_embeddings WHERE chunk_id IN (
-                  SELECT id FROM kb_chunks WHERE meeting_id = ? AND source_file = ?
-                )
-                """
-        ) { stmt in
-            try stmt.bind(text: meetingId, at: 1)
-            try stmt.bind(text: sourceFile, at: 2)
-            _ = try stmt.step()
-        }
-        try await db.withStatement(
-            sql: "DELETE FROM kb_chunks WHERE meeting_id = ? AND source_file = ?"
-        ) { stmt in
-            try stmt.bind(text: meetingId, at: 1)
-            try stmt.bind(text: sourceFile, at: 2)
-            _ = try stmt.step()
+        try await db.transaction {
+            try await db.withStatement(
+                sql: """
+                    DELETE FROM kb_embeddings WHERE chunk_id IN (
+                      SELECT id FROM kb_chunks WHERE meeting_id = ? AND source_file = ?
+                    )
+                    """
+            ) { stmt in
+                try stmt.bind(text: meetingId, at: 1)
+                try stmt.bind(text: sourceFile, at: 2)
+                _ = try stmt.step()
+            }
+            try await db.withStatement(
+                sql: "DELETE FROM kb_chunks WHERE meeting_id = ? AND source_file = ?"
+            ) { stmt in
+                try stmt.bind(text: meetingId, at: 1)
+                try stmt.bind(text: sourceFile, at: 2)
+                _ = try stmt.step()
+            }
         }
     }
 

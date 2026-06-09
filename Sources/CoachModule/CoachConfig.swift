@@ -18,6 +18,11 @@ public struct CoachConfig: Sendable, Codable, Hashable {
     /// 30 (spec §5/§407 "~30s"). A longer interval means fewer model calls — which
     /// matters when the stage is routed to a paid cloud model.
     public var conversationStateIntervalSeconds: Int
+    /// Maximum auto-cue pipelines analysing at once (each can hold several
+    /// model calls). When saturated, the newest utterance supersedes the one
+    /// waiting (latest-wins) and the skip is surfaced, never silent. Clamped to
+    /// 1…4 at the point of use.
+    public var maxConcurrentIngests: Int
     public var manualTrigger: ManualTriggerConfig
 
     public init(
@@ -28,6 +33,7 @@ public struct CoachConfig: Sendable, Codable, Hashable {
         antiFabricationPostCheck: Bool = false,
         conversationStateEnabled: Bool = true,
         conversationStateIntervalSeconds: Int = 30,
+        maxConcurrentIngests: Int = 2,
         manualTrigger: ManualTriggerConfig = .default
     ) {
         self.enabled = enabled
@@ -37,13 +43,14 @@ public struct CoachConfig: Sendable, Codable, Hashable {
         self.antiFabricationPostCheck = antiFabricationPostCheck
         self.conversationStateEnabled = conversationStateEnabled
         self.conversationStateIntervalSeconds = conversationStateIntervalSeconds
+        self.maxConcurrentIngests = maxConcurrentIngests
         self.manualTrigger = manualTrigger
     }
 
     private enum CodingKeys: String, CodingKey {
         case enabled, modes, surfaceBudget, adaptiveThrottle
         case antiFabricationPostCheck, conversationStateEnabled
-        case conversationStateIntervalSeconds, manualTrigger
+        case conversationStateIntervalSeconds, maxConcurrentIngests, manualTrigger
     }
 
     /// Tolerant decoder: each field falls back to its default when absent, so a
@@ -64,6 +71,8 @@ public struct CoachConfig: Sendable, Codable, Hashable {
         self.conversationStateIntervalSeconds =
             try c.decodeIfPresent(Int.self, forKey: .conversationStateIntervalSeconds)
             ?? d.conversationStateIntervalSeconds
+        self.maxConcurrentIngests =
+            try c.decodeIfPresent(Int.self, forKey: .maxConcurrentIngests) ?? d.maxConcurrentIngests
         self.manualTrigger = try c.decodeIfPresent(ManualTriggerConfig.self, forKey: .manualTrigger) ?? d.manualTrigger
     }
 

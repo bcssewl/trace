@@ -243,10 +243,13 @@ public actor FileRepository {
     /// Optionally narrows to one project (`projectID` non-nil) — the driver for
     /// the per-project Files / Voice Memos category lists; pass `nil` for the
     /// global "All files" / "All voice memos" surfaces. `origins` empty → `[]`.
+    ///
+    /// `limit` defaults to unbounded — the old default of 500 silently hid
+    /// older rows; the list views render lazily so large lists are cheap.
     public func list(
         origins: Set<FileBatchJob.Origin>,
         projectID: String? = nil,
-        limit: Int = 500
+        limit: Int = Int.max
     ) async throws -> [FileRecord] {
         guard !origins.isEmpty else { return [] }
         let (placeholders, originValues) = SqlInClause.build(origins)
@@ -296,14 +299,81 @@ public actor FileRepository {
         }
     }
 
-    /// Permanently deletes a file row (the UI "Delete" action).
+    /// Permanently deletes a file row (the UI "Delete" action), along with its
+    /// `entry_fts` keyword-search row so the deleted item can't ghost in search
+    /// until the next entry reconcile.
     ///
     /// The on-disk
     /// transcript/source files are left untouched — the caller decides whether
     /// to remove those.
     public func delete(id: UUID) async throws {
-        try await database.withStatement(sql: "DELETE FROM files WHERE id = ?") { stmt in
+        try await database.transaction {
+            try await database.withStatement(
+                sql: "DELETE FROM entry_fts WHERE source = 'file' AND item_id = ?"
+            ) { stmt in
+                try stmt.bind(text: id.uuidString, at: 1)
+                _ = try stmt.step()
+            }
+            try await database.withStatement(sql: "DELETE FROM files WHERE id = ?") { stmt in
+                try stmt.bind(text: id.uuidString, at: 1)
+                _ = try stmt.step()
+            }
+        }
+    }
+
+    // MARK: Crash recovery (storage batch)
+
+    /// Rows whose status is still non-terminal — after a crash these are jobs
+    /// the in-memory queue forgot about. Ordered oldest first.
+    public func nonTerminalRecords() async throws -> [FileRecord] {
+        let nonTerminal = FileBatchStatus.allCases.filter { !$0.isTerminal }
+        let placeholders = nonTerminal.map { _ in "?" }.joined(separator: ", ")
+        let sql = """
+            SELECT \(Self.selectColumns)
+              FROM files
+             WHERE status IN (\(placeholders))
+             ORDER BY created_at ASC
+            """
+        return try await database.withStatement(sql: sql) { stmt in
+            for (offset, status) in nonTerminal.enumerated() {
+                try stmt.bind(text: status.rawValue, at: Int32(offset + 1))
+            }
+            var out: [FileRecord] = []
+            while try stmt.step() == .row {
+                if let rec = Self.decodeRow(stmt) { out.append(rec) }
+            }
+            return out
+        }
+    }
+
+    /// How many times start-up recovery has already re-queued this job.
+    public func recoveryAttempts(id: UUID) async throws -> Int {
+        try await database.withStatement(
+            sql: "SELECT recovery_attempts FROM files WHERE id = ?"
+        ) { stmt in
             try stmt.bind(text: id.uuidString, at: 1)
+            guard try stmt.step() == .row else { return 0 }
+            return stmt.columnInt(at: 0)
+        }
+    }
+
+    /// Reset a crashed-out row back to `queued` and bump its recovery counter
+    /// (one atomic UPDATE). Stale partial results are cleared so the retried
+    /// run starts clean.
+    public func markRequeuedForRecovery(id: UUID) async throws {
+        let sql = """
+            UPDATE files
+               SET status = ?,
+                   recovery_attempts = recovery_attempts + 1,
+                   transcript_path = NULL,
+                   duration_ms = NULL,
+                   error_reason = NULL,
+                   completed_at = NULL
+             WHERE id = ?
+            """
+        try await database.withStatement(sql: sql) { stmt in
+            try stmt.bind(text: FileBatchStatus.queued.rawValue, at: 1)
+            try stmt.bind(text: id.uuidString, at: 2)
             _ = try stmt.step()
         }
     }

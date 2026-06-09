@@ -303,6 +303,13 @@ struct MenuBarPopoverContentView: View {
             )
             sectionLabel("Controls")
             popRow(symbol: "stop.circle", text: "Stop & finalize", kbd: "⌘ ⇧ .", action: commands.stopMeeting)
+            // Way back in after "Dismiss for this meeting" hid the coach panel.
+            // Only offered while the coach is actually on for this meeting.
+            if state.coachEnabled {
+                popRow(symbol: "sparkles", text: "Show coach", kbd: "") {
+                    NotificationCenter.default.post(name: .traceCoachOverlayReopen, object: nil)
+                }
+            }
             Spacer()
             Rectangle().fill(palette.borderSoft.color).frame(height: 1)
             popRow(symbol: "books.vertical", text: "Open library", kbd: "⌘ O", action: commands.openLibrary)

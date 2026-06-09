@@ -66,6 +66,14 @@ jobs:
           fi
           echo "value=$VALUE" >>"$GITHUB_OUTPUT"
           echo "tag=$TAG"     >>"$GITHUB_OUTPUT"
+          # A hyphen in the version (v1.2.3-beta.1) marks a pre-release: it is
+          # excluded from releases/latest (the Stable update channel) and only
+          # reaches installs on the Beta channel via the rolling beta-feed.
+          if [[ "$VALUE" == *-* ]]; then
+              echo "prerelease=true"  >>"$GITHUB_OUTPUT"
+          else
+              echo "prerelease=false" >>"$GITHUB_OUTPUT"
+          fi
 
       - name: Fetch Sparkle framework (public release, no secret)
         run: |
@@ -164,8 +172,34 @@ jobs:
           "Download" section for details.
           EOF
           )
+          PRERELEASE_FLAG=()
+          [ "${{ steps.version.outputs.prerelease }}" = "true" ] && PRERELEASE_FLAG=(--prerelease)
           gh release create "${{ steps.version.outputs.tag }}" "${ASSETS[@]}" \
               --title "Trace ${{ steps.version.outputs.value }}" \
               --notes "$NOTES" \
+              "${PRERELEASE_FLAG[@]}" \
               --verify-tag=false || \
           gh release upload "${{ steps.version.outputs.tag }}" "${ASSETS[@]}" --clobber
+
+      - name: Refresh the rolling Beta-channel feed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The Beta update channel reads a constant URL:
+          #   releases/download/beta-feed/appcast.xml
+          # Every release — stable or pre-release — refreshes it, so Beta-channel
+          # installs always see the newest build of either kind. (Stable installs
+          # read releases/latest, which GitHub keeps clear of pre-releases.)
+          if [ ! -f dist/feed/appcast.xml ]; then
+              echo "::warning::No appcast generated — Beta feed not refreshed."
+              exit 0
+          fi
+          if ! gh release view beta-feed >/dev/null 2>&1; then
+              gh release create beta-feed \
+                  --title "Beta update feed (rolling)" \
+                  --notes "Machine-readable Sparkle feed for the Beta update channel. Always points at the newest build, pre-release or stable. Not for manual download — use the latest release instead." \
+                  --prerelease \
+                  --target "$GITHUB_SHA"
+          fi
+          gh release upload beta-feed dist/feed/appcast.xml --clobber

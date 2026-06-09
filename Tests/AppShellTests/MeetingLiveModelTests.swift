@@ -152,4 +152,71 @@ final class MeetingLiveModelTests: XCTestCase {
         XCTAssertEqual(model.displayName(for: "remote_1"), "Alex", "renames survive a refinement swap")
         XCTAssertEqual(model.speakers.first?.displayName, "Alex")
     }
+
+    // MARK: Summary phase (post-meeting finalisation lifecycle)
+
+    func testSummaryPhaseTransitionsIncludingFailure() {
+        let model = MeetingLiveModel()
+        model.begin(sessionId: "s", title: "t")
+        XCTAssertEqual(model.summaryPhase, .idle)
+
+        model.setSummaryPhase(.preparing)
+        XCTAssertEqual(model.summaryPhase, .preparing)
+
+        model.setSummaryPhase(.generating)
+        XCTAssertEqual(model.summaryPhase, .generating)
+
+        model.setSummaryFailed("Couldn't build the summary.")
+        XCTAssertEqual(model.summaryPhase, .failed("Couldn't build the summary."))
+
+        model.setSummaryPhase(.done)
+        XCTAssertEqual(model.summaryPhase, .done)
+    }
+
+    func testSummaryPhaseIndependentOfRollingSummaryStream() {
+        // The in-meeting rolling summary streams text via setSummary; that must
+        // never put the view into a finalisation phase.
+        let model = MeetingLiveModel()
+        model.begin(sessionId: "s", title: "t")
+        model.setSummary("rolling so far", isFinal: false)
+        XCTAssertEqual(model.summaryState, .streaming)
+        XCTAssertEqual(model.summaryPhase, .idle)
+    }
+
+    func testBeginResetsFinalisationState() {
+        let model = MeetingLiveModel()
+        model.begin(sessionId: "a", title: "A")
+        model.setSummaryPhase(.failed("boom"))
+        model.raiseStorageNotice("disk problem")
+        model.scrollTargetTime = 12.5
+        model.regenerateSummary = { _ in }
+
+        model.begin(sessionId: "b", title: "B")
+
+        XCTAssertEqual(model.summaryPhase, .idle)
+        XCTAssertTrue(model.storageNotices.isEmpty)
+        XCTAssertNil(model.scrollTargetTime)
+        XCTAssertNil(model.regenerateSummary, "the previous session's regenerate hook must not survive")
+        XCTAssertFalse(model.isRegenerating)
+        XCTAssertFalse(model.canRegenerate)
+    }
+
+    // MARK: Storage notices (loud persistence failures)
+
+    func testRaiseStorageNoticeDeduplicatesAndDismisses() {
+        let model = MeetingLiveModel()
+        model.begin(sessionId: "s", title: "t")
+
+        model.raiseStorageNotice("The transcript may be incomplete.")
+        model.raiseStorageNotice("The transcript may be incomplete.")
+        model.raiseStorageNotice("The summary couldn't be saved.")
+
+        XCTAssertEqual(
+            model.storageNotices,
+            ["The transcript may be incomplete.", "The summary couldn't be saved."],
+            "repeat failures surface once; distinct failures stack")
+
+        model.dismissStorageNotice("The transcript may be incomplete.")
+        XCTAssertEqual(model.storageNotices, ["The summary couldn't be saved."])
+    }
 }

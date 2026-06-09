@@ -40,23 +40,60 @@ public final class CoachOverlayController {
         configurePanel()
         installRootView()
         panel.orderOut(nil)
-        // The in-overlay "Hide" / dismiss posts this; minimize-to-pill on receipt.
+        // The in-overlay "Minimise" button posts this; minimise-to-pill on receipt.
         NotificationCenter.default.addObserver(
             forName: .traceCoachOverlayHide, object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated { self?.minimizeToPill() }
         }
+        // The in-overlay "Dismiss" button (and ⌥esc) posts this; genuinely hide
+        // for the rest of the meeting on receipt.
+        NotificationCenter.default.addObserver(
+            forName: .traceCoachOverlayDismiss, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.dismissForMeeting() }
+        }
+        // Reopen hook (menu bar / coordinator) for a dismissed overlay.
+        NotificationCenter.default.addObserver(
+            forName: .traceCoachOverlayReopen, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reopen() }
+        }
         installKeyMonitor()
-        observeMode()
     }
 
-    /// React to every `state.mode` change — whether the controller flips it
-    /// (present/update/minimize) or the SwiftUI tree does (pill button, ask chip,
+    // MARK: Mode observation (armed only while the panel is visible)
+
+    /// Generation token: re-arming bumps it so a stale armed tracking from a
+    /// previous show/hide cycle dies on its (single) late fire instead of
+    /// resurrecting the loop.
+    private var observationGeneration = 0
+    /// Whether the observation loop should keep re-arming. False while the
+    /// overlay is hidden/dismissed — there is nothing to re-frame off-screen, so
+    /// the loop is torn down rather than ticking forever.
+    private var observationActive = false
+
+    private func startObservingModeIfNeeded() {
+        guard !observationActive else { return }
+        observationActive = true
+        observationGeneration += 1
+        armModeObservation(generation: observationGeneration)
+    }
+
+    private func stopObservingMode() {
+        // An already-armed tracking may fire once more; the generation/active
+        // guards in its onChange make it a no-op that does not re-arm.
+        observationActive = false
+    }
+
+    /// React to `state.mode` / `state.pillHovered` changes — whether the
+    /// controller flips them or the SwiftUI tree does (pill button, ask chip,
     /// header expand).
     ///
     /// On a pill↔card transition we re-frame the NSPanel so the
-    /// content is never clipped into the wrong size. Re-arms after each fire.
-    private func observeMode() {
+    /// content is never clipped into the wrong size. Re-arms after each fire,
+    /// but ONLY while the overlay is visible (`observationActive`).
+    private func armModeObservation(generation: Int) {
         withObservationTracking {
             _ = state.mode
             // Also track pill-hover: hovering the collapsed pill grows its frame so
@@ -64,9 +101,11 @@ public final class CoachOverlayController {
             _ = state.pillHovered
         } onChange: { [weak self] in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.observationActive,
+                    generation == self.observationGeneration
+                else { return }
                 self.syncFrameToMode()
-                self.observeMode()
+                self.armModeObservation(generation: generation)
             }
         }
     }
@@ -173,18 +212,27 @@ public final class CoachOverlayController {
     /// Show the panel, restoring its persisted frame on first present (no longer
     /// re-anchoring every call).
     ///
+    /// An explicit present (meeting start, manual trigger) always clears a
+    /// dismissed-for-meeting state — the user asked for the coach back.
+    ///
     /// The SwiftUI tree draws over a live
     /// NSVisualEffectView material so it stays legible over any call background.
     public func present(projectName: String = "Project") {
         state.projectName = projectName
+        state.dismissState.reopen()
         // Size the panel for the current mode before showing it (the observation
         // path only fires on subsequent *changes*, not the initial present).
         syncFrameToMode(force: !hasRestoredFrame)
         hasRestoredFrame = true
         panel.orderFrontRegardless()
+        startObservingModeIfNeeded()
     }
 
     public func update(activeCard: CoachCard?) {
+        // While dismissed for the meeting, new cards must not repopulate the
+        // hidden panel (they would pop up stale on the next present). Clearing
+        // (nil) is always allowed.
+        if activeCard != nil, !state.dismissState.acceptsCards { return }
         state.activeCard = activeCard
         // A real card surfaces the full cue card; a silent/empty result must NOT
         // pop an empty card — stay compact (behavioral fix).
@@ -208,15 +256,61 @@ public final class CoachOverlayController {
         }
     }
 
+    /// Apply an orchestrator health event to the overlay: drives the status
+    /// banner (model unavailable / recovered) and the skipped-cues counter.
+    ///
+    /// The orchestrator's emission is already edge-triggered (one event per
+    /// outage), and the banner model additionally honours a user dismissal — so
+    /// a dead model shows one banner, not one per utterance.
+    public func applyHealthEvent(_ event: CoachHealthEvent) {
+        state.health.apply(event)
+    }
+
+    /// Reset per-meeting overlay state (health banner, skipped-cue counter,
+    /// dismissed-for-meeting). Call at meeting start, alongside
+    /// `CoachOrchestrator.beginMeeting()`.
+    public func prepareForNewMeeting() {
+        state.health.resetForNewMeeting()
+        state.dismissState.reopen()
+    }
+
     public func hide() {
+        stopObservingMode()
         panel.orderOut(nil)
     }
 
-    /// Minimize to the compact pill rather than fully hiding — the coach keeps
+    /// Minimise to the compact pill rather than fully hiding — the coach keeps
     /// listening; the user can click the pill to bring the card back.
     public func minimizeToPill() {
         state.mode = .compact
         state.activeCard = nil
+    }
+
+    /// Genuinely hide the overlay for the rest of the meeting (the "Dismiss"
+    /// button / ⌥esc): the panel orders out and incoming cards no longer
+    /// repopulate it.
+    ///
+    /// The pipeline keeps running — detections still land in the
+    /// recent-cues log. Reopen via `reopen()` (or any explicit `present`, e.g.
+    /// the manual trigger), and a new meeting always starts fresh.
+    public func dismissForMeeting() {
+        state.dismissState.dismissForMeeting()
+        state.activeCard = nil
+        state.mode = .compact
+        state.surfacedAt = nil
+        stopObservingMode()
+        panel.orderOut(nil)
+    }
+
+    /// Bring back a dismissed/hidden overlay without touching the project name —
+    /// the coordinator/menu-bar reopen hook (also reachable via the
+    /// `.traceCoachOverlayReopen` notification).
+    public func reopen() {
+        state.dismissState.reopen()
+        syncFrameToMode(force: !hasRestoredFrame)
+        hasRestoredFrame = true
+        panel.orderFrontRegardless()
+        startObservingModeIfNeeded()
     }
 
     public func applyAppearance(_ preference: AppearancePreference) {
@@ -233,14 +327,17 @@ public final class CoachOverlayController {
 
     /// Real ⌥esc dismiss hotkey (BAS redesign).
     ///
-    /// A non-activating panel never holds
-    /// key focus, so a local monitor catches it whenever Trace is frontmost; the
-    /// global fallback handles it during a call when another app is frontmost.
+    /// ⌥esc DISMISSES for the rest of
+    /// the meeting — matching the header button labelled "Dismiss (⌥esc)" — it
+    /// does not merely minimise. A non-activating panel never holds key focus,
+    /// so a local monitor catches it whenever Trace is frontmost; the global
+    /// fallback (registered by the coordinator) handles it during a call when
+    /// another app is frontmost.
     private func installKeyMonitor() {
         keyMonitorBox.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // ⌥esc: option held + escape (keyCode 53).
             if event.keyCode == 53, event.modifierFlags.contains(.option) {
-                MainActor.assumeIsolated { self?.minimizeToPill() }
+                MainActor.assumeIsolated { self?.dismissForMeeting() }
                 return nil
             }
             return event
@@ -482,20 +579,19 @@ final class CoachHostingView<Content: View>: NSHostingView<Content> {
     }
 }
 
-public struct RecentTrigger: Sendable, Hashable, Identifiable {
-    public let id: UUID
-    public let timestamp: Date
-    public let label: String
-    public let mode: CoachCardMode
-    public let wasSurfaced: Bool
+// NOTE: `RecentTrigger` moved into CoachModule (Sources/CoachModule/RecentTrigger.swift)
+// so its label hygiene — clamping empty/garbled LLM titles to an honest per-mode
+// fallback — is enforced at the data layer for every caller.
 
-    public init(id: UUID = UUID(), timestamp: Date = Date(), label: String, mode: CoachCardMode, wasSurfaced: Bool) {
-        self.id = id
-        self.timestamp = timestamp
-        self.label = label
-        self.mode = mode
-        self.wasSurfaced = wasSurfaced
-    }
+/// Notifications the overlay's own SwiftUI tree posts (and the coordinator may
+/// post) to drive the controller. Defined here, next to their handlers.
+extension Notification.Name {
+    /// Genuinely dismiss the overlay for the rest of the meeting (the header
+    /// "Dismiss" button / ⌥esc). Distinct from `.traceCoachOverlayHide`, which
+    /// minimises to the pill.
+    public static let traceCoachOverlayDismiss = Notification.Name("app.trace.coachOverlayDismiss")
+    /// Reopen a dismissed overlay (menu-bar / coordinator hook).
+    public static let traceCoachOverlayReopen = Notification.Name("app.trace.coachOverlayReopen")
 }
 
 public enum CoachOverlayMode: Sendable {
@@ -517,8 +613,15 @@ public final class CoachOverlayStateModel {
     /// When the current passive card was surfaced — drives the auto-dismiss timer.
     public var surfacedAt: Date?
     /// True while the mouse hovers the collapsed pill — reveals the Ask chips and
-    /// grows the pill frame to fit them (see `syncFrameToMode`/`observeMode`).
+    /// grows the pill frame to fit them (see `syncFrameToMode`).
     public var pillHovered: Bool = false
+    /// Health banner + skipped-cues state, driven by orchestrator health events
+    /// via `CoachOverlayController.applyHealthEvent`. The model (in CoachModule)
+    /// owns the dismissal/rate-limit rules so they're testable without AppKit.
+    public var health = CoachHealthBannerModel()
+    /// Dismissed-for-meeting state (the "Dismiss" button / ⌥esc) — model-level
+    /// so the semantics are testable without AppKit.
+    public var dismissState = CoachOverlayDismissState()
 
     public init() {}
 }
@@ -607,7 +710,17 @@ struct CoachOverlayRootView: View {
                 state.mode = .card
             } label: {
                 HStack(spacing: 9) {
-                    BrutalistPulsingDot(color: palette.primary.color, size: 7)
+                    if let banner = state.health.activeMessage {
+                        // Health problem → the pill says so even while collapsed
+                        // (amber warning replaces the listening dot; full text in
+                        // the card's banner).
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 9, weight: .semibold))
+                            .foregroundStyle(BrutalistPalette.semantic(scheme).warning.color)
+                            .help(banner)
+                    } else {
+                        BrutalistPulsingDot(color: palette.primary.color, size: 7)
+                    }
                     Text("Coach")
                         .font(BrutalistTypography.labelEmphasis)
                         .foregroundStyle(palette.fg.color)
@@ -708,6 +821,10 @@ struct CoachOverlayRootView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Rectangle().fill(palette.borderSoft.color).frame(height: 1)
+            if let banner = state.health.activeMessage {
+                healthBanner(banner)
+                Rectangle().fill(palette.borderSoft.color).frame(height: 1)
+            }
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     cueSection
@@ -743,17 +860,48 @@ struct CoachOverlayRootView: View {
             ) {
                 state.mode = state.mode == .expanded ? .card : .expanded
             }
-            iconButton(systemName: "minus", help: "Minimize") {
+            iconButton(systemName: "minus", help: "Minimise to pill") {
                 NotificationCenter.default.post(name: .traceCoachOverlayHide, object: nil)
             }
-            iconButton(systemName: "xmark", help: "Dismiss (⌥esc)") {
-                NotificationCenter.default.post(name: .traceCoachOverlayHide, object: nil)
+            iconButton(systemName: "xmark", help: "Dismiss for this meeting (⌥esc)") {
+                NotificationCenter.default.post(name: .traceCoachOverlayDismiss, object: nil)
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 9)
         // Whole panel is drag-anywhere (isMovableByWindowBackground); the header's
         // own buttons still consume their clicks, so no explicit drag region needed.
+    }
+
+    /// Non-intrusive, dismissible health banner (model unavailable / RAG
+    /// degraded). One per outage — the banner model + the orchestrator's
+    /// edge-triggered events keep it from re-raising per utterance.
+    private func healthBanner(_ message: String) -> some View {
+        let semantic = BrutalistPalette.semantic(scheme)
+        return HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(semantic.warning.color)
+                .padding(.top, 1)
+            Text(message)
+                .font(BrutalistTypography.caption)
+                .foregroundStyle(palette.fg.color)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button {
+                state.health.dismissCurrent()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(palette.fgMuted.color)
+                    .frame(width: 18, height: 18)
+            }
+            .coachRoundedButton(radius: 5, palette: palette)
+            .help("Hide this notice")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(semantic.warning.color.opacity(scheme == .dark ? 0.14 : 0.10))
     }
 
     private func iconButton(systemName: String, help: String, action: @escaping () -> Void) -> some View {
@@ -781,13 +929,19 @@ struct CoachOverlayRootView: View {
     private func cueCard(_ card: CoachCard) -> some View {
         let trust = Self.trustBadge(for: card.mode)
         return VStack(alignment: .leading, spacing: 9) {
-            // mode badge — one restrained per-mode dot, not everything orange
+            // mode badge — one restrained per-mode dot, not everything orange —
+            // plus the cue's surfacing time, so a card that's been sitting there
+            // can't masquerade as fresh.
             HStack(spacing: 6) {
                 Circle().fill(Self.modeColor(card.mode, scheme: scheme, palette: palette)).frame(width: 6, height: 6)
                 Text(trust.label)
                     .font(BrutalistTypography.captionEmphasis)
                     .foregroundStyle(palette.fgMuted.color)
                 Spacer()
+                Text(card.createdAt, style: .time)
+                    .font(BrutalistTypography.caption)
+                    .foregroundStyle(palette.fgMuted.color)
+                    .help("When this cue surfaced")
             }
             // context (what they asked)
             if !card.title.isEmpty {
@@ -921,6 +1075,19 @@ struct CoachOverlayRootView: View {
                     .font(BrutalistTypography.caption)
                     .foregroundStyle(palette.fgMuted.color)
             }
+            // Load shedding is never silent: when concurrency pressure skips
+            // cues, say so here (subtle, but visible).
+            if let skipped = state.health.skippedCueMessage {
+                HStack(spacing: 6) {
+                    Image(systemName: "forward.end")
+                        .font(.system(size: 8))
+                        .foregroundStyle(palette.fgMuted.color)
+                    Text(skipped)
+                        .font(BrutalistTypography.caption)
+                        .foregroundStyle(palette.fgMuted.color)
+                    Spacer(minLength: 0)
+                }
+            }
             ForEach(state.recentTriggers) { trigger in
                 HStack(spacing: 8) {
                     Circle()
@@ -931,6 +1098,9 @@ struct CoachOverlayRootView: View {
                         .foregroundStyle(trigger.wasSurfaced ? palette.fg.color : palette.fgSidebar.color)
                         .lineLimit(1)
                     Spacer()
+                    Text(trigger.timestamp, style: .time)
+                        .font(BrutalistTypography.caption)
+                        .foregroundStyle(palette.fgMuted.color)
                     Text(trigger.mode.rawValue.capitalized)
                         .font(BrutalistTypography.caption)
                         .foregroundStyle(palette.fgMuted.color)

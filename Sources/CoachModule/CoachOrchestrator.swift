@@ -38,6 +38,31 @@ public actor CoachOrchestrator {
     private let throttle: BurstDecayThrottle
     private let antiFabChecker: (any AntiFabricationChecking)?
     private var conversationState: String = ""
+
+    // MARK: Health events (loud failure surfacing)
+
+    /// Live subscribers to `healthEvents()`.
+    private var healthContinuations: [UUID: AsyncStream<CoachHealthEvent>.Continuation] = [:]
+    /// Stages currently known to be failing — emission is edge-triggered off this
+    /// set, so a dead model produces ONE `stageUnavailable` per outage (the rate
+    /// limit), then ONE `stageRecovered` when it works again.
+    private var failingHealthStages: Set<CoachPipelineStage> = []
+
+    // MARK: Bounded in-flight ingestion (see `enqueue`)
+
+    /// Hard cap on concurrently running auto-ingest pipelines. Each pipeline can
+    /// hold several LLM calls (classifier + router + synthesis), so 2 in flight
+    /// already means up to ~4–6 outstanding model calls in a fast meeting.
+    /// Configurable via `CoachConfig.maxConcurrentIngests` (Advanced setting);
+    /// clamped here so a bad persisted value can never unbound the load.
+    private var maxConcurrentIngests: Int { min(4, max(1, config.maxConcurrentIngests)) }
+    private var inFlightIngests = 0
+    /// The single "next up" slot: when saturated, the NEWEST waiting utterance
+    /// sits here and any previous occupant is superseded (latest-wins — for
+    /// real-time help, fresher context always beats a backlog).
+    private var pendingIngestWaiter: (id: UUID, continuation: CheckedContinuation<Bool, Never>)?
+    /// Cues superseded under load this meeting. Reset by `beginMeeting()`.
+    public private(set) var skippedCueCount = 0
     /// Count of cards auto-surfaced in the current meeting — gated by
     /// `config.surfaceBudget`.
     ///
@@ -92,8 +117,125 @@ public actor CoachOrchestrator {
         lastAutoSurfaceAt = nil
         recentAutoSurfaces = []
         conversationState = ""
+        skippedCueCount = 0
+        // Fresh health baseline: a still-dead model re-emits its (single)
+        // unavailable event on the new meeting's first failure.
+        failingHealthStages = []
         await throttle.reset()
         await embeddingDetector.setProjectScope(projectID)
+    }
+
+    // MARK: Health events
+
+    /// Subscribe to the orchestrator's health: per-stage model failures and
+    /// recoveries, plus load-shedding notices.
+    ///
+    /// Emission is edge-triggered (one
+    /// `stageUnavailable` per outage, one `stageRecovered` per recovery), so the
+    /// subscriber can drive a banner directly without its own rate limiting.
+    /// Multiple subscribers each get every event; a cancelled subscriber is
+    /// cleaned up automatically.
+    public func healthEvents() -> AsyncStream<CoachHealthEvent> {
+        AsyncStream { continuation in
+            let id = UUID()
+            healthContinuations[id] = continuation
+            continuation.onTermination = { [weak self] _ in
+                Task { await self?.removeHealthContinuation(id) }
+            }
+        }
+    }
+
+    private func removeHealthContinuation(_ id: UUID) {
+        healthContinuations[id] = nil
+    }
+
+    private func emitHealth(_ event: CoachHealthEvent) {
+        for continuation in healthContinuations.values {
+            continuation.yield(event)
+        }
+    }
+
+    /// Record a stage failure; emits `stageUnavailable` only on the
+    /// healthy→failing edge.
+    private func noteStageFailure(_ stage: CoachPipelineStage, _ error: Error) {
+        guard !failingHealthStages.contains(stage) else { return }
+        failingHealthStages.insert(stage)
+        emitHealth(.stageUnavailable(stage: stage, reason: String(describing: error)))
+    }
+
+    /// Record a stage success; emits `stageRecovered` only on the
+    /// failing→healthy edge.
+    private func noteStageSuccess(_ stage: CoachPipelineStage) {
+        guard failingHealthStages.contains(stage) else { return }
+        failingHealthStages.remove(stage)
+        emitHealth(.stageRecovered(stage: stage))
+    }
+
+    // MARK: Bounded in-flight ingestion
+
+    /// `ingest` behind a bounded in-flight policy for the AUTO path: at most
+    /// `maxConcurrentIngests` pipelines run at once; when saturated the newest
+    /// utterance waits in a single "next" slot and supersedes whatever was
+    /// already waiting there (latest-wins — for real-time help a fresh cue beats
+    /// a backlog).
+    ///
+    /// Returns nil when THIS utterance was superseded; that is never
+    /// silent — the skip increments `skippedCueCount` and emits a
+    /// `.cueSkipped` health event.
+    ///
+    /// Manual (`userRequested`) utterances bypass
+    /// the cap entirely: the user explicitly asked for help right now, and they
+    /// are rare enough not to threaten the load this cap exists to bound.
+    public func enqueue(utterance: CoachUtterance, windowText: String? = nil) async throws -> PipelineResult? {
+        if utterance.userRequested {
+            return try await ingest(utterance: utterance, windowText: windowText)
+        }
+        guard await admitIngest() else {
+            skippedCueCount += 1
+            emitHealth(.cueSkipped(totalSkippedThisMeeting: skippedCueCount))
+            return nil
+        }
+        defer { releaseIngestSlot() }
+        return try await ingest(utterance: utterance, windowText: windowText)
+    }
+
+    /// Number of pipelines currently in flight via `enqueue` (test/diagnostic
+    /// visibility for the cap).
+    public var inFlightIngestCount: Int { inFlightIngests }
+    /// Whether an utterance is waiting in the single "next" slot.
+    public var hasQueuedCue: Bool { pendingIngestWaiter != nil }
+
+    /// Take an ingest slot, waiting in the single latest-wins pending slot when
+    /// saturated. Returns false when superseded by a newer utterance.
+    private func admitIngest() async -> Bool {
+        if inFlightIngests < maxConcurrentIngests {
+            inFlightIngests += 1
+            return true
+        }
+        // Saturated: occupy the pending slot, superseding any current occupant.
+        if let superseded = pendingIngestWaiter {
+            pendingIngestWaiter = nil
+            superseded.continuation.resume(returning: false)
+        }
+        // Admission (true) arrives via slot transfer in `releaseIngestSlot`, so
+        // the in-flight count is already accounted for — don't increment here.
+        return await withCheckedContinuation { continuation in
+            pendingIngestWaiter = (UUID(), continuation)
+        }
+    }
+
+    private func releaseIngestSlot() {
+        // Only transfer the slot while within the (possibly just-lowered) cap —
+        // a mid-meeting cap reduction drains down to the new bound naturally.
+        if inFlightIngests <= maxConcurrentIngests, let waiter = pendingIngestWaiter {
+            // Transfer this slot to the waiter (count stays the same) — this
+            // ordering means no third pipeline can slip in between release and
+            // the waiter's resumption.
+            pendingIngestWaiter = nil
+            waiter.continuation.resume(returning: true)
+        } else {
+            inFlightIngests -= 1
+        }
     }
 
     public func updateConversationState(_ next: String) {
@@ -123,16 +265,24 @@ public actor CoachOrchestrator {
         }
         // RAG is optional infrastructure (embeddings route to Ollama). If it's
         // unavailable, degrade to "no RAG hits" rather than failing the whole
-        // pipeline — regex hits + manual triggers must still surface cards.
+        // pipeline — regex hits + manual triggers must still surface cards. The
+        // degradation is NOT silent: the first failure emits an
+        // `embeddingUnavailable` health event so the overlay can say so.
         let embedding: EmbeddingDetector.Result
         do {
             embedding = try await embeddingDetector.evaluate(
                 utterance: utterance.text, windowText: windowText
             )
+            noteStageSuccess(.embedding)
         } catch {
+            noteStageFailure(.embedding, error)
             embedding = EmbeddingDetector.Result(topHits: [], topScore: 0, topicShifted: false)
         }
-        if regexHits.isEmpty && embedding.topScore < EmbeddingDetector.topicShiftCosineThreshold
+        // Attention gate for the no-regex auto path: only an utterance whose top
+        // RAG hit clears `ragAttentionMinCosine` earns the LLM stages. Note this
+        // is deliberately stricter than the router's `synthesizableMinCosine` —
+        // see CoachThresholds for the relationship.
+        if regexHits.isEmpty && embedding.topScore < CoachThresholds.ragAttentionMinCosine
             && !utterance.userRequested
         {
             return PipelineResult(
@@ -141,9 +291,20 @@ public actor CoachOrchestrator {
                 routingOutput: nil, card: nil, throttleDecision: nil
             )
         }
-        let classification = try await classifier.classify(
-            utterance: utterance.text, regexHits: regexHits
-        )
+        // The classifier and router are REQUIRED stages: a failure here means no
+        // card can be produced, so classify it for the health stream (one event
+        // per outage) and rethrow — the caller's catch stays in charge of the
+        // per-utterance flow, but the failure is no longer invisible.
+        let classification: UtteranceClass
+        do {
+            classification = try await classifier.classify(
+                utterance: utterance.text, regexHits: regexHits
+            )
+            noteStageSuccess(.classifier)
+        } catch {
+            noteStageFailure(.classifier, error)
+            throw error
+        }
         if classification == .none && !utterance.userRequested {
             return PipelineResult(
                 utterance: utterance, regexHits: regexHits,
@@ -157,7 +318,14 @@ public actor CoachOrchestrator {
             conversationState: conversationState, userRequested: utterance.userRequested,
             intent: utterance.intent
         )
-        let routing = try await smartRouter.decide(routingInput)
+        let routing: SmartRoutingOutput
+        do {
+            routing = try await smartRouter.decide(routingInput)
+            noteStageSuccess(.router)
+        } catch {
+            noteStageFailure(.router, error)
+            throw error
+        }
         guard routing.mode != .silent, modeEnabled(routing.mode) else {
             return PipelineResult(
                 utterance: utterance, regexHits: regexHits,

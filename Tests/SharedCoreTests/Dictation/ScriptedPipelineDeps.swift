@@ -53,6 +53,7 @@ actor ScriptedASR: PipelineASR {
     private let failOnFinish: TraceError?
     private(set) var beginCount = 0
     private(set) var finishCount = 0
+    private(set) var cancelCount = 0
 
     init(finalText: String, failOnFinish: TraceError? = nil) {
         self.finalText = finalText
@@ -67,6 +68,35 @@ actor ScriptedASR: PipelineASR {
         finishCount += 1
         if let failure = failOnFinish { throw failure }
         return finalText
+    }
+
+    func cancelCycle() async {
+        cancelCount += 1
+    }
+}
+
+/// A cleanup double that blocks until released — used to hold a cycle's tail
+/// open so chained-start behaviour can be exercised deterministically.
+actor GatedCleanup: PipelineCleanup {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var released = false
+    private(set) var calls = 0
+
+    func clean(rawText: String, systemPrompt: String, routeOverride: LLMRoute?) async throws -> String {
+        calls += 1
+        if !released {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                waiters.append(c)
+            }
+        }
+        return rawText.uppercased()
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
     }
 }
 

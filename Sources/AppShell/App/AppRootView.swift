@@ -30,7 +30,8 @@ public struct AppRootView: View {
                 MainWindowRootView(
                     projectStore: environment.projectStore,
                     captureState: environment.state.activeCapture,
-                    appState: environment.state
+                    appState: environment.state,
+                    notices: environment.notices
                 )
             }
         }

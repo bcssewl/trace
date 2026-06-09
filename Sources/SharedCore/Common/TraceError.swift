@@ -95,7 +95,10 @@ public enum TraceError: Error, Sendable, CustomStringConvertible {
         case .permissionDenied(let kind):
             switch kind {
             case .microphone: return .openSystemSettings(pane: "Privacy_Microphone")
-            case .systemAudio: return .openSystemSettings(pane: "Privacy_AudioCapture")
+            // macOS 14.4+ merged audio capture into the "Screen & System Audio
+            // Recording" pane (Privacy_ScreenCapture). The old Privacy_AudioCapture
+            // URL no-ops on macOS 26.
+            case .systemAudio: return .openSystemSettings(pane: "Privacy_ScreenCapture")
             case .accessibility: return .openSystemSettings(pane: "Privacy_Accessibility")
             case .speechRecognition: return .openSystemSettings(pane: "Privacy_SpeechRecognition")
             case .calendar: return .openSystemSettings(pane: "Privacy_Calendars")

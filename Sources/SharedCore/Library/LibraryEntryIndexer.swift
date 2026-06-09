@@ -183,21 +183,25 @@ public actor LibraryEntryIndexer {
         // non-Sendable Desired (its `loadText`).
         let (itemId, source, projectId) = (entry.itemId, entry.source, entry.projectId)
         let (title, startedAt, sig) = (entry.title, entry.startedAt, entry.sig)
-        try await deleteEntry(itemId)
-        try await db.withStatement(
-            sql: """
-                INSERT INTO entry_fts (item_id, source, project_id, title, started_at, sig, text)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """
-        ) { stmt in
-            try stmt.bind(text: itemId, at: 1)
-            try stmt.bind(text: source.rawValue, at: 2)
-            try stmt.bind(optionalText: projectId, at: 3)
-            try stmt.bind(text: title, at: 4)
-            try stmt.bind(int64: startedAt, at: 5)
-            try stmt.bind(text: sig, at: 6)
-            try stmt.bind(text: text, at: 7)
-            _ = try stmt.step()
+        // Delete + insert in one transaction so a crash can't drop the item
+        // from keyword search until the next signature change.
+        try await db.transaction {
+            try await deleteEntry(itemId)
+            try await db.withStatement(
+                sql: """
+                    INSERT INTO entry_fts (item_id, source, project_id, title, started_at, sig, text)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """
+            ) { stmt in
+                try stmt.bind(text: itemId, at: 1)
+                try stmt.bind(text: source.rawValue, at: 2)
+                try stmt.bind(optionalText: projectId, at: 3)
+                try stmt.bind(text: title, at: 4)
+                try stmt.bind(int64: startedAt, at: 5)
+                try stmt.bind(text: sig, at: 6)
+                try stmt.bind(text: text, at: 7)
+                _ = try stmt.step()
+            }
         }
     }
 

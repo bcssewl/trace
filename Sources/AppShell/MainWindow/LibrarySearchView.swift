@@ -17,6 +17,9 @@ public struct LibrarySearchView: View {
     @Bindable var model: LibrarySearchModel
     @FocusState private var queryFocused: Bool
     @State private var debounceTask: Task<Void, Never>?
+    /// Groups the user expanded to see every matched snippet (collapsed rows
+    /// show the top three). Reset whenever a new query's results land.
+    @State private var expandedGroups: Set<String> = []
 
     public init(model: LibrarySearchModel) {
         self.model = model
@@ -304,7 +307,9 @@ public struct LibrarySearchView: View {
     }
 
     private func keywordGroupRow(_ group: KeywordGroup) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        let isExpanded = expandedGroups.contains(group.id)
+        let shownHits = isExpanded ? group.hits : Array(group.hits.prefix(3))
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 BrutalistChip(Self.sourceBadge(group.source), active: true)
                 Text(group.title)
@@ -315,7 +320,7 @@ public struct LibrarySearchView: View {
                     .font(BrutalistTypography.mono10)
                     .foregroundStyle(palette.fgMuted.color)
             }
-            ForEach(Array(group.hits.prefix(3))) { hit in
+            ForEach(shownHits) { hit in
                 HStack(alignment: .top, spacing: 8) {
                     if let ts = hit.timestamp {
                         Text(TranscriptChunker.timeLabel(ts))
@@ -334,6 +339,18 @@ public struct LibrarySearchView: View {
                     .font(BrutalistTypography.caption)
                     .foregroundStyle(palette.fgMuted.color)
                 BrutalistButton("Open", kind: .ghost, size: .compact) { openGroup(group) }
+                if group.hitCount > 3 {
+                    BrutalistButton(
+                        isExpanded ? "Show fewer" : "Show all \(group.hitCount) matches",
+                        kind: .ghost, size: .compact
+                    ) {
+                        if isExpanded {
+                            expandedGroups.remove(group.id)
+                        } else {
+                            expandedGroups.insert(group.id)
+                        }
+                    }
+                }
             }
         }
         .padding(BrutalistMetrics.space3)
@@ -527,6 +544,7 @@ public struct LibrarySearchView: View {
     /// Q&A waits for an explicit Return (LLM calls are expensive).
     private func queryEdited() {
         model.queryDidChange()
+        expandedGroups = []
         debounceTask?.cancel()
         guard !model.normalizedQuery.isEmpty, model.effectiveMode == .keyword else { return }
         debounceTask = Task {
@@ -539,6 +557,7 @@ public struct LibrarySearchView: View {
     /// Run immediately (Return key, mode toggle, scope change).
     private func runNow() {
         debounceTask?.cancel()
+        expandedGroups = []
         Task {
             await model.runSearch()
             // A successful answer proves the model stack is reachable; only re-probe

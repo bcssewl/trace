@@ -96,18 +96,45 @@ public struct FtsIndex: Sendable {
     }
 
     public func upsertNotes(meetingId: String, text: String) async throws {
-        try await database.withStatement(
-            sql: "DELETE FROM notes_fts WHERE meeting_id = ?"
-        ) { stmt in
-            try stmt.bind(text: meetingId, at: 1)
-            _ = try stmt.step()
+        // One transaction: a crash between the DELETE and the INSERT must not
+        // leave the meeting's notes silently missing from search.
+        try await database.transaction {
+            try await database.withStatement(
+                sql: "DELETE FROM notes_fts WHERE meeting_id = ?"
+            ) { stmt in
+                try stmt.bind(text: meetingId, at: 1)
+                _ = try stmt.step()
+            }
+            try await database.withStatement(
+                sql: "INSERT INTO notes_fts (meeting_id, text) VALUES (?, ?)"
+            ) { stmt in
+                try stmt.bind(text: meetingId, at: 1)
+                try stmt.bind(text: text, at: 2)
+                _ = try stmt.step()
+            }
         }
+    }
+
+    /// Number of indexed transcript rows for one meeting — the reconciler's
+    /// cheap "does the index match the JSONL?" probe.
+    public func transcriptRowCount(meetingId: String) async throws -> Int {
         try await database.withStatement(
-            sql: "INSERT INTO notes_fts (meeting_id, text) VALUES (?, ?)"
+            sql: "SELECT COUNT(*) FROM transcript_fts WHERE meeting_id = ?"
         ) { stmt in
             try stmt.bind(text: meetingId, at: 1)
-            try stmt.bind(text: text, at: 2)
-            _ = try stmt.step()
+            let res = try stmt.step()
+            return res == .row ? stmt.columnInt(at: 0) : 0
+        }
+    }
+
+    /// The currently indexed notes text for one meeting (nil when unindexed).
+    public func notesText(meetingId: String) async throws -> String? {
+        try await database.withStatement(
+            sql: "SELECT text FROM notes_fts WHERE meeting_id = ? LIMIT 1"
+        ) { stmt in
+            try stmt.bind(text: meetingId, at: 1)
+            guard try stmt.step() == .row else { return nil }
+            return stmt.columnText(at: 0)
         }
     }
 

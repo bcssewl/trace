@@ -34,12 +34,24 @@ public actor ModeRegistry {
 
     /// Idempotent.
     ///
-    /// Repeated calls are no-ops.
+    /// Repeated calls after a SUCCESS are no-ops. A FAILED bootstrap rolls its
+    /// partial state back and leaves the registry retryable — a transient
+    /// resource/DB hiccup at one launch must not latch dictation off until
+    /// reinstall; the next `bootstrap()` (next dictation start) tries again
+    /// from scratch.
     public func bootstrap() async throws {
         guard !bootstrapped else { return }
-        try loadBuiltins()
-        if case .sqlite(let db) = persistence {
-            try await loadCustomModes(from: db)
+        do {
+            try loadBuiltins()
+            if case .sqlite(let db) = persistence {
+                try await loadCustomModes(from: db)
+            }
+        } catch {
+            modes.removeAll()
+            Loggers.dictation.error(
+                "ModeRegistry bootstrap failed (will retry on next start): \(String(describing: error), privacy: .public)"
+            )
+            throw error
         }
         bootstrapped = true
         Loggers.dictation.info("ModeRegistry bootstrapped with \(self.modes.count, privacy: .public) modes")

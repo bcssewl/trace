@@ -14,14 +14,28 @@ public final class SystemAudioCapture: @unchecked Sendable {
         public let framesObserved: Int64
         public let secondsObserved: TimeInterval
         public let zeroBufferRunSeconds: TimeInterval
+        /// Sticky: true once any non-silent buffer has been delivered since the
+        /// capture started. Distinguishes "tap is authorized and working" from
+        /// "tap reports success but only ever yields digital silence" (the
+        /// permission-not-taking-effect case on a quarantined/translocated app).
+        public let hasObservedNonZeroAudio: Bool
     }
 
     public struct TestHooks: Sendable {
         public let watchdogThreshold: TimeInterval
         public let simulatedRunning: @Sendable () -> Bool
-        public init(watchdogThreshold: TimeInterval, simulatedRunning: @escaping @Sendable () -> Bool) {
+        /// Invoked at the start of every rebuild pass, on the control queue.
+        /// Tests block here to pile up concurrent rebuild requests and prove
+        /// they coalesce instead of overlapping.
+        public let rebuildHold: (@Sendable () -> Void)?
+        public init(
+            watchdogThreshold: TimeInterval,
+            simulatedRunning: @escaping @Sendable () -> Bool,
+            rebuildHold: (@Sendable () -> Void)? = nil
+        ) {
             self.watchdogThreshold = watchdogThreshold
             self.simulatedRunning = simulatedRunning
+            self.rebuildHold = rebuildHold
         }
     }
 
@@ -29,12 +43,26 @@ public final class SystemAudioCapture: @unchecked Sendable {
     private let buffersContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
 
     private let onRebuildBox = OSAllocatedUnfairLock<(@Sendable () -> Void)>(initialState: {})
+    private let onHealthEventBox = OSAllocatedUnfairLock<(@Sendable (CaptureHealthEvent) -> Void)?>(
+        initialState: nil)
 
     public func setOnRebuild(_ closure: @escaping @Sendable () -> Void) {
         onRebuildBox.withLock { $0 = closure }
     }
 
+    /// Observe capture health: watchdog/device-change recoveries and rebuild
+    /// failures. `.rebuildFailed` means capture has STOPPED and the buffer
+    /// stream is finished — surface it loudly, never degrade silently.
+    public func setOnHealthEvent(_ closure: @escaping @Sendable (CaptureHealthEvent) -> Void) {
+        onHealthEventBox.withLock { $0 = closure }
+    }
+
     private let isRunning = SyncBool(initial: false)
+    /// Sticky: set once `buffersContinuation` is finished (on stop or fatal
+    /// rebuild failure). A finished stream can never deliver again, so this
+    /// instance is single-use — `start()` after `stop()` throws instead of
+    /// silently capturing into a dead stream.
+    private let streamFinished = SyncBool(initial: false)
     private let tapIDBox = OSAllocatedUnfairLock(initialState: AudioObjectID(kAudioObjectUnknown))
     private let aggIDBox = OSAllocatedUnfairLock(initialState: AudioObjectID(kAudioObjectUnknown))
     private let ioProcIDBox = OSAllocatedUnfairLock<AudioDeviceIOProcID?>(initialState: nil)
@@ -43,10 +71,29 @@ public final class SystemAudioCapture: @unchecked Sendable {
     private let secondsObservedLock = OSAllocatedUnfairLock(initialState: TimeInterval(0))
     private let lastNonZeroLock = OSAllocatedUnfairLock(initialState: Date())
     private let zeroRunLock = OSAllocatedUnfairLock(initialState: TimeInterval(0))
+    /// Sticky flag set the first time a non-silent buffer is delivered. Once the
+    /// tap has produced real audio we know it's genuinely authorized, so a later
+    /// run of silence is just a quiet call — not a permission failure.
+    private let observedNonZero = SyncBool(initial: false)
 
+    // Accessed ONLY on `control`'s queue (start/stop/rebuild bodies), which is
+    // what makes these plain vars safe on an @unchecked Sendable class.
     private var watchdogTimer: DispatchSourceTimer?
     private var deviceWatcher: DeviceWatcher?
     private var deviceWatcherTask: Task<Void, Never>?
+
+    /// Serialises start/stop/rebuild and coalesces overlapping rebuild
+    /// requests (watchdog + device watcher can fire together; the HAL must
+    /// never see two concurrent tearDown/build passes).
+    private let control = SerialRebuildCoordinator(label: "app.trace.audio.system-tap.control")
+
+    /// Reuse pool for IO-proc buffers — see `AudioBufferPool`. Rebuilt to the
+    /// tap format on every (re)build; consumers opt in via `recycle(_:)`.
+    private let bufferPool = AudioBufferPool(maxPooledBuffers: 16)
+    /// Pooled buffer capacity. HAL chunks for an aggregate tap are typically
+    /// ≤2048 frames; 4096 gives headroom so acquire never misses on size.
+    private static let pooledCapacityFrames: AVAudioFrameCount = 4_096
+
     private let ioQueue: DispatchQueue
     private let testHooks: TestHooks?
 
@@ -73,30 +120,82 @@ public final class SystemAudioCapture: @unchecked Sendable {
         return false
     }
 
+    /// Best-effort: is the system's default OUTPUT device actively doing IO
+    /// (i.e. some app is playing audio out of the Mac right now)?
+    ///
+    /// Used to tell "the other side is genuinely silent" apart from "our tap is
+    /// deaf": if audio is playing out but the tap only ever delivers digital
+    /// silence, the System Audio Recording permission isn't taking effect. A
+    /// read-only property query — safe to call from any thread.
+    public static func isDefaultOutputActive() -> Bool {
+        guard let outID = try? DeviceWatcher.currentDefaultOutputDeviceID(),
+            outID != kAudioObjectUnknown
+        else { return false }
+        var running: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsRunningSomewhere,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain)
+        let status = AudioObjectGetPropertyData(outID, &addr, 0, nil, &size, &running)
+        return status == noErr && running != 0
+    }
+
     public func start() throws {
-        guard isRunning.compareAndSwap(expected: false, desired: true) else { return }
-        do {
-            try buildPipeline()
-            startWatchdog()
-            startDeviceWatcher()
-            Loggers.audio.info("SystemAudioCapture started")
-        } catch {
-            isRunning.value = false
-            tearDownCoreAudioResources()
-            throw error
+        try control.withExclusiveControl {
+            guard isRunning.compareAndSwap(expected: false, desired: true) else { return }
+            guard !streamFinished.value else {
+                isRunning.value = false
+                throw TraceError.audioCaptureFailed(
+                    reason:
+                        "SystemAudioCapture is single-use: its buffer stream finished when it stopped. Create a fresh instance."
+                )
+            }
+            do {
+                if testHooks == nil {
+                    try buildPipelineOnQueue()
+                }
+                startWatchdogOnQueue()
+                if testHooks == nil {
+                    startDeviceWatcherOnQueue()
+                }
+                Loggers.audio.info("SystemAudioCapture started")
+            } catch {
+                isRunning.value = false
+                tearDownCoreAudioResources()
+                throw error
+            }
         }
     }
 
     public func stop() {
-        guard isRunning.compareAndSwap(expected: true, desired: false) else { return }
+        control.withExclusiveControl {
+            guard isRunning.compareAndSwap(expected: true, desired: false) else { return }
+            stopAuxiliariesOnQueue()
+            tearDownCoreAudioResources()
+            bufferPool.drain()
+            // Finish the buffer stream: stop() means this capture will never
+            // deliver again, and a finished stream is what lets consumers
+            // (the meeting pipeline) drain to a clean end-of-stream instead of
+            // hanging on an open-but-dead stream.
+            finishStreamOnQueue()
+            Loggers.audio.info("SystemAudioCapture stopped")
+        }
+    }
+
+    /// Cancel watchdog + device watcher. Control-queue only.
+    private func stopAuxiliariesOnQueue() {
         watchdogTimer?.cancel()
         watchdogTimer = nil
         deviceWatcher?.stop()
         deviceWatcher = nil
         deviceWatcherTask?.cancel()
         deviceWatcherTask = nil
-        tearDownCoreAudioResources()
-        Loggers.audio.info("SystemAudioCapture stopped")
+    }
+
+    private func finishStreamOnQueue() {
+        guard streamFinished.compareAndSwap(expected: false, desired: true) else { return }
+        buffersContinuation.finish()
     }
 
     public func diagnostics() -> Diagnostics {
@@ -109,14 +208,31 @@ public final class SystemAudioCapture: @unchecked Sendable {
             tapFormatChannelCount: asbd.mChannelsPerFrame,
             framesObserved: framesObservedLock.withLock { $0 },
             secondsObserved: secondsObservedLock.withLock { $0 },
-            zeroBufferRunSeconds: zeroRunLock.withLock { $0 })
+            zeroBufferRunSeconds: zeroRunLock.withLock { $0 },
+            hasObservedNonZeroAudio: observedNonZero.value)
     }
 
     public func injectForTesting(_ buffer: AVAudioPCMBuffer) {
         ioProcDeliver(buffer)
     }
 
-    private func buildPipeline() throws {
+    /// Hand a buffer received from `buffers` back for reuse once you have
+    /// finished reading it (copied out whatever samples you need).
+    ///
+    /// Optional: consumers that never recycle just leave the IO proc on its
+    /// allocate-fresh fallback (the previous behaviour). Never recycle a
+    /// buffer something else may still be reading — that aliases live audio.
+    public func recycle(_ buffer: AVAudioPCMBuffer) {
+        bufferPool.recycle(buffer)
+    }
+
+    /// Pool stats, exposed for tests/diagnostics.
+    public var bufferPoolStats: AudioBufferPool.Stats {
+        bufferPool.stats
+    }
+
+    /// Control-queue only.
+    private func buildPipelineOnQueue() throws {
         guard Self.isSupported() else {
             throw TraceError.audioCaptureFailed(
                 reason: "SystemAudioCapture requires macOS 14.4 or newer")
@@ -159,6 +275,14 @@ public final class SystemAudioCapture: @unchecked Sendable {
                 reason: "kAudioTapPropertyFormat unreadable after 10 retries (BadObject)")
         }
         tapFormatBox.withLock { $0 = asbd }
+
+        // Pre-size the IO buffer reuse pool to the (possibly new) tap format so
+        // the steady-state IO callback never allocates.
+        var asbdForFormat = asbd
+        if let avFormat = AVAudioFormat(streamDescription: &asbdForFormat) {
+            bufferPool.rebuild(
+                format: avFormat, capacityFrames: Self.pooledCapacityFrames, preallocate: 8)
+        }
 
         Loggers.audio.info(
             "SystemAudioCapture tap created: rate=\(asbd.mSampleRate, privacy: .public) ch=\(asbd.mChannelsPerFrame, privacy: .public)"
@@ -246,7 +370,17 @@ public final class SystemAudioCapture: @unchecked Sendable {
         let firstBuf = withUnsafePointer(to: abl.mBuffers) { $0.pointee }
         let frameCount = AVAudioFrameCount(Int(firstBuf.mDataByteSize) / bytesPerFrame)
 
-        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
+        // Reuse a pooled buffer when one is available (steady state once the
+        // consumer recycles); otherwise fall back to a fresh allocation, sized
+        // to pool capacity so it becomes poolable when recycled.
+        let buf: AVAudioPCMBuffer
+        if let pooled = bufferPool.acquire(frameCount: frameCount, format: format) {
+            buf = pooled
+        } else if let fresh = AVAudioPCMBuffer(
+            pcmFormat: format, frameCapacity: max(frameCount, Self.pooledCapacityFrames))
+        {
+            buf = fresh
+        } else {
             return
         }
         buf.frameLength = frameCount
@@ -284,6 +418,7 @@ public final class SystemAudioCapture: @unchecked Sendable {
 
         let rms = AudioBufferHelpers.rms(buffer)
         if rms > 0 {
+            observedNonZero.value = true
             lastNonZeroLock.withLock { $0 = Date() }
             zeroRunLock.withLock { $0 = 0 }
         } else {
@@ -293,7 +428,8 @@ public final class SystemAudioCapture: @unchecked Sendable {
         buffersContinuation.yield(buffer)
     }
 
-    private func startWatchdog() {
+    /// Control-queue only.
+    private func startWatchdogOnQueue() {
         let threshold = testHooks?.watchdogThreshold ?? 30.0
         let q = DispatchQueue(label: "app.trace.audio.system-tap.watchdog")
         let timer = DispatchSource.makeTimerSource(queue: q)
@@ -311,6 +447,9 @@ public final class SystemAudioCapture: @unchecked Sendable {
 
     private func watchdogTick(threshold: TimeInterval) {
         guard isRunning.value else { return }
+        // Stand down while a rebuild is queued or in flight: a tick observing
+        // the silence run that *caused* the rebuild must not request another.
+        guard !control.isRebuildPendingOrActive else { return }
         let zeroRun = zeroRunLock.withLock { $0 }
         guard zeroRun >= threshold else { return }
 
@@ -321,7 +460,9 @@ public final class SystemAudioCapture: @unchecked Sendable {
             "SystemAudioCapture all-zero watchdog fired: zeroRun=\(zeroRun, privacy: .public)s threshold=\(threshold, privacy: .public)s. Rebuilding."
         )
         zeroRunLock.withLock { $0 = 0 }
-        rebuild()
+        requestRebuild(
+            reason: "all-zero watchdog (\(Int(zeroRun))s silent)",
+            trigger: .watchdogTriggeredRebuild(silentSeconds: zeroRun))
     }
 
     private func deviceIsRunningSomewhere() -> Bool {
@@ -337,7 +478,8 @@ public final class SystemAudioCapture: @unchecked Sendable {
         return status == noErr && running != 0
     }
 
-    private func startDeviceWatcher() {
+    /// Control-queue only.
+    private func startDeviceWatcherOnQueue() {
         let watcher = DeviceWatcher()
         do {
             try watcher.start()
@@ -351,31 +493,65 @@ public final class SystemAudioCapture: @unchecked Sendable {
         deviceWatcherTask = Task { [weak self] in
             for await event in eventStream {
                 guard let self else { return }
-                if case .defaultOutputChanged = event {
+                if case .defaultOutputChanged(let deviceID) = event {
+                    let name = (try? DeviceWatcher.deviceName(for: deviceID)) ?? "unknown"
                     Loggers.audio.info(
-                        "SystemAudioCapture: default output changed; rebuilding tap")
-                    self.rebuild()
+                        "SystemAudioCapture: default output changed to \(name, privacy: .public) (id=\(deviceID, privacy: .public)); rebuilding tap"
+                    )
+                    self.requestRebuild(
+                        reason: "default output changed to \(name)",
+                        trigger: .deviceChangeTriggeredRebuild)
                 }
             }
         }
     }
 
-    private func rebuild() {
+    /// Request a pipeline rebuild. Serialised on the control queue; overlapping
+    /// requests coalesce to at most one trailing rebuild. Safe from any thread.
+    ///
+    /// Internal (not private) so tests can drive the coalescing logic directly.
+    internal func requestRebuild(reason: String, trigger: CaptureHealthEvent? = nil) {
+        let scheduled = control.requestRebuild { [weak self] in
+            self?.performRebuildOnQueue()
+        }
+        if scheduled, let trigger {
+            emitHealth(trigger)
+        } else if !scheduled {
+            Loggers.audio.info(
+                "SystemAudioCapture rebuild request coalesced (\(reason, privacy: .public))")
+        }
+    }
+
+    /// Control-queue only — invoked solely via `control.requestRebuild`.
+    private func performRebuildOnQueue() {
         guard isRunning.value else { return }
+        testHooks?.rebuildHold?()
         tearDownCoreAudioResources()
         do {
             if testHooks == nil {
-                try buildPipeline()
+                try buildPipelineOnQueue()
             }
             zeroRunLock.withLock { $0 = 0 }
             let cb = onRebuildBox.withLock { $0 }
             cb()
+            emitHealth(.rebuildSucceeded)
+            Loggers.audio.info("SystemAudioCapture rebuilt; capture resumed")
         } catch {
             Loggers.audio.error(
                 "SystemAudioCapture rebuild failed: \(error.localizedDescription, privacy: .public)")
             isRunning.value = false
-            buffersContinuation.finish()
+            stopAuxiliariesOnQueue()
+            bufferPool.drain()
+            finishStreamOnQueue()
+            // Loud failure: capture is dead and the stream is finished. The
+            // health event is what lets the runtime tell the user instead of
+            // silently recording one side of the meeting.
+            emitHealth(.rebuildFailed(reason: error.localizedDescription))
         }
+    }
+
+    private func emitHealth(_ event: CaptureHealthEvent) {
+        (onHealthEventBox.withLock { $0 })?(event)
     }
 
     internal static func retryOnBadObject<T>(

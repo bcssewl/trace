@@ -31,6 +31,7 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
         bootSparkle()
+        resumePendingParakeetTakeover()
         menuBarController = MenuBarController(
             state: environment.state,
             palette: environment.palette,
@@ -145,9 +146,46 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         self.updaterController = UpdaterController(driver: adapter, configuration: sparkleConfig)
         // Apply the persisted auto-update preference (BAS-24).
         self.updaterController?.setAutomaticChecks(enabled: environment.state.autoUpdatesEnabled)
+        // Apply the persisted channel choice (Stable/Beta) to the feed URL.
+        applyUpdateChannel()
         Loggers.bootstrap.info(
             "Sparkle updater wired with feed=\(sparkleConfig.feedURL.absoluteString, privacy: .public)")
         observeUpdaterNotifications()
+    }
+
+    /// Points Sparkle at the feed matching the user's channel choice.
+    ///
+    /// * Stable → the validated bootstrap feed (the `releases/latest` appcast,
+    ///   which GitHub keeps aimed at the newest non-pre-release build).
+    /// * Beta → the rolling `beta-feed` release's appcast, which CI refreshes on
+    ///   every tag — pre-release and stable alike — so the Beta channel always
+    ///   sees the newest build of either kind.
+    ///
+    /// The Beta URL is derived from the stable one by convention. If the stable
+    /// feed doesn't match the expected GitHub-releases shape (e.g. a custom
+    /// `SU_FEED_URL` build), there is no beta variant to derive, so the choice
+    /// cannot be honoured — we say so loudly in the log and stay on the
+    /// configured feed rather than guessing at a URL that may not exist.
+    private func applyUpdateChannel() {
+        guard let stable = updaterController?.sparkleConfig?.feedURL else { return }
+        let wantsBeta = environment.state.updateChannel == "Beta"
+        guard wantsBeta else {
+            updaterController?.overrideFeedURL(stable)
+            return
+        }
+        let stableSuffix = "/releases/latest/download/appcast.xml"
+        let betaSuffix = "/releases/download/beta-feed/appcast.xml"
+        let absolute = stable.absoluteString
+        guard absolute.hasSuffix(stableSuffix),
+              let beta = URL(string: String(absolute.dropLast(stableSuffix.count)) + betaSuffix)
+        else {
+            Loggers.bootstrap.error(
+                "Update channel is Beta but the configured feed \(stable.absoluteString, privacy: .public) has no derivable beta variant — staying on the configured feed"
+            )
+            updaterController?.overrideFeedURL(stable)
+            return
+        }
+        updaterController?.overrideFeedURL(beta)
     }
 
     /// Bridges Settings → Updates (a SwiftUI view) to the Sparkle updater the
@@ -161,11 +199,28 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.updaterController?.setAutomaticChecks(enabled: self.environment.state.autoUpdatesEnabled)
+                self.applyUpdateChannel()
             }
         }
     }
 
     public func userRequestedCheckForUpdates() {
         updaterController?.checkForUpdates()
+    }
+
+    /// If onboarding promised a Parakeet take-over (its practice step fell back
+    /// to Apple Speech mid-download) and the app quit before the download
+    /// finished, resume it now so the promise survives relaunch. The
+    /// take-over itself fires via `AsrModelInstallCoordinator.onParakeetReady`,
+    /// wired in `AppEnvironment`.
+    private func resumePendingParakeetTakeover() {
+        guard environment.state.parakeetTakeoverPending else { return }
+        let install = environment.asrInstall
+        Task { @MainActor in
+            await install.probeReadiness()  // already on disk → fires the take-over
+            if !install.parakeetReady {
+                install.start()
+            }
+        }
     }
 }

@@ -28,6 +28,11 @@ struct MeetingsLibraryView: View {
     }
     @State private var route: Route = .list
     @State private var didAutoOpen = false
+    /// Incremental rendering: how many rows are currently shown. More load
+    /// automatically as the bottom sentinel scrolls into view (with a manual
+    /// "Load more" as well), so a multi-year library stays snappy.
+    @State private var visibleCount = MeetingsLibraryView.pageSize
+    static let pageSize = 100
 
     var body: some View {
         Group {
@@ -54,6 +59,7 @@ struct MeetingsLibraryView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(palette.background.color)
         .task(id: taskKey) {
+            visibleCount = Self.pageSize
             if inboxOnly {
                 await library?.refreshInbox()
             } else {
@@ -121,7 +127,12 @@ struct MeetingsLibraryView: View {
                 if isMeetingActive { liveBanner }
 
                 if let meetings = library?.meetings, !meetings.isEmpty {
-                    ForEach(meetings, id: \.sessionId) { meetingRow($0) }
+                    LazyVStack(alignment: .leading, spacing: 0) {
+                        ForEach(meetings.prefix(visibleCount), id: \.sessionId) { meetingRow($0) }
+                        if meetings.count > visibleCount {
+                            loadMoreRow(total: meetings.count)
+                        }
+                    }
                 } else if library?.isLoading == true {
                     loadingState.padding(.top, 50)
                 } else if inboxOnly {
@@ -130,6 +141,27 @@ struct MeetingsLibraryView: View {
                     emptyState
                 }
             }
+        }
+    }
+
+    /// Bottom sentinel: loads the next page automatically when scrolled into
+    /// view, with an explicit button for good measure.
+    private func loadMoreRow(total: Int) -> some View {
+        HStack(spacing: 10) {
+            Text("Showing \(visibleCount) of \(total)")
+                .font(BrutalistTypography.caption)
+                .foregroundStyle(palette.fgMuted.color)
+            BrutalistButton("Load more", kind: .ghost, size: .compact) {
+                visibleCount += Self.pageSize
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .onAppear {
+            // LazyVStack only materialises this row once the user reaches the
+            // bottom, so appearing == "scrolled to the end → fetch more".
+            visibleCount += Self.pageSize
         }
     }
 

@@ -13,6 +13,7 @@ import SwiftUI
 @MainActor
 public struct DictationModesSettingsView: View {
     @Environment(\.brutalistPalette) private var palette
+    @Environment(\.colorScheme) private var scheme
 
     /// The actor that owns the modes.
     ///
@@ -37,6 +38,9 @@ public struct DictationModesSettingsView: View {
     @State private var loaded = false
     @State private var persists = true
     @State private var errorText: String?
+    /// Invalid mode patterns recorded by the resolver (`ModeDiagnostics`) —
+    /// shown inline so the user knows why a mode never matches.
+    @State private var patternIssues: [ModePatternIssue] = []
 
     public init() {}
 
@@ -61,9 +65,36 @@ public struct DictationModesSettingsView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .task {
             await loadInitial()
+            patternIssues = ModeDiagnostics.shared.currentIssues()
         }
         .onChange(of: selectedID) { _, _ in
             syncEditFields()
+        }
+        // Invalid patterns are skipped at resolution time and recorded here —
+        // show the user WHY their mode never matches, and self-clear when the
+        // pattern compiles again.
+        .onReceive(NotificationCenter.default.publisher(for: ModeDiagnostics.issuesDidChange)) { _ in
+            patternIssues = ModeDiagnostics.shared.currentIssues()
+        }
+    }
+
+    /// The recorded compile failure for one of this mode's patterns, if any.
+    private func patternIssue(for mode: Mode, field: ModePatternIssue.Field) -> ModePatternIssue? {
+        patternIssues.first { $0.modeID == mode.id && $0.field == field }
+    }
+
+    @ViewBuilder
+    private func patternIssueLabel(_ issue: ModePatternIssue?) -> some View {
+        if let issue {
+            HStack(alignment: .firstTextBaseline, spacing: 5) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 10))
+                    .foregroundStyle(BrutalistPalette.SemanticColors.resolve(scheme).warning.color)
+                Text("This pattern doesn't compile, so the mode is being skipped: \(issue.message)")
+                    .font(BrutalistTypography.caption)
+                    .foregroundStyle(palette.fgMuted.color)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -260,20 +291,26 @@ public struct DictationModesSettingsView: View {
                 hint:
                     "Which apps this mode applies to, matched by app ID. For example, ^com\\.apple\\.mail$ for Mail, or .* for every app."
             ) {
-                TextField(".*", text: $editRegex)
-                    .textFieldStyle(.plain)
-                    .font(BrutalistTypography.mono11)
-                    .foregroundStyle(palette.fg.color)
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField(".*", text: $editRegex)
+                        .textFieldStyle(.plain)
+                        .font(BrutalistTypography.mono11)
+                        .foregroundStyle(palette.fg.color)
+                    patternIssueLabel(patternIssue(for: mode, field: .bundleIDRegex))
+                }
             }
             fieldRow(
                 title: "Or a specific website",
                 hint:
                     "Optional. If the app above is a browser, this matches the site in the active tab and takes priority over the app. For example, mail\\.google\\.com."
             ) {
-                TextField("mail\\.google\\.com", text: $editURLRegex)
-                    .textFieldStyle(.plain)
-                    .font(BrutalistTypography.mono11)
-                    .foregroundStyle(palette.fg.color)
+                VStack(alignment: .leading, spacing: 4) {
+                    TextField("mail\\.google\\.com", text: $editURLRegex)
+                        .textFieldStyle(.plain)
+                        .font(BrutalistTypography.mono11)
+                        .foregroundStyle(palette.fg.color)
+                    patternIssueLabel(patternIssue(for: mode, field: .urlRegex))
+                }
             }
             fieldRow(title: "Where the text goes", hint: "How the tidied-up text ends up in the app.") {
                 Picker("", selection: $editInsert) {

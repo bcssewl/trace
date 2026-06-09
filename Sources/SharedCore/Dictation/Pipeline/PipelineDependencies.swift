@@ -42,6 +42,15 @@ public protocol PipelineASR: Sendable {
     /// Flushes the streaming state and returns the assembled text. After this
     /// call, the backend is expected to be idle and ready for the next cycle.
     func finishCycle() async throws -> String
+    /// Abandons the in-flight cycle without producing a transcript: stop
+    /// consuming audio, drop buffered samples, and discard any crash-recovery
+    /// spool (the user deliberately cancelled — there is nothing to recover).
+    /// Default implementation is a no-op for stateless conformers.
+    func cancelCycle() async
+}
+
+extension PipelineASR {
+    public func cancelCycle() async {}
 }
 
 /// LLM cleanup contract.

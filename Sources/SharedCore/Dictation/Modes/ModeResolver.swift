@@ -21,15 +21,21 @@ public struct ModeResolver: Sendable {
     /// (BAS-5). `nil` disables URL matching entirely (modes resolve on bundle ID
     /// only — the prior behavior).
     private let browserTabReader: (any BrowserTabReading)?
+    /// Loud sink for invalid user patterns: a broken regex skips its mode but
+    /// is error-logged + queryable for Settings instead of silently breaking
+    /// (or, worse, aborting) resolution.
+    private let diagnostics: ModeDiagnostics
 
     public init(
         registry: ModeRegistry,
         bundleIDProvider: @escaping @Sendable () -> String?,
-        browserTabReader: (any BrowserTabReading)? = nil
+        browserTabReader: (any BrowserTabReading)? = nil,
+        diagnostics: ModeDiagnostics = .shared
     ) {
         self.registry = registry
         self.bundleIDProvider = bundleIDProvider
         self.browserTabReader = browserTabReader
+        self.diagnostics = diagnostics
     }
 
     public func resolveCurrent() async throws -> Mode {
@@ -47,13 +53,25 @@ public struct ModeResolver: Sendable {
             {
                 var urlMatches: [Mode] = []
                 for mode in candidates {
-                    // `try?` not `try`: a single mode with an invalid `urlRegex`
-                    // (free-text user field, no live validation) must skip itself,
-                    // not abort resolution for EVERY mode and leave dictation with
-                    // no mode whenever a browser is frontmost. `try?` flattens the
-                    // function's `NSRegularExpression?` to a single optional (nil =
-                    // either not URL-scoped, or a bad pattern → skip this mode).
-                    guard let regex = try? mode.compiledURLRegex() else { continue }
+                    // A single mode with an invalid `urlRegex` (free-text user
+                    // field) must skip itself, not abort resolution for EVERY
+                    // mode and leave dictation with no mode whenever a browser
+                    // is frontmost — but the skip is LOUD: error-logged and
+                    // recorded in ModeDiagnostics for Settings to display.
+                    let regex: NSRegularExpression?
+                    do {
+                        regex = try mode.compiledURLRegex()
+                        diagnostics.clear(modeID: mode.id, field: .urlRegex)
+                    } catch {
+                        diagnostics.report(
+                            ModePatternIssue(
+                                modeID: mode.id, modeName: mode.name, field: .urlRegex,
+                                pattern: mode.urlRegex ?? "",
+                                message: error.localizedDescription
+                            ))
+                        continue
+                    }
+                    guard let regex else { continue }  // not URL-scoped
                     let range = NSRange(tab.url.startIndex..., in: tab.url)
                     if regex.firstMatch(in: tab.url, options: [], range: range) != nil {
                         urlMatches.append(mode)
@@ -68,7 +86,23 @@ public struct ModeResolver: Sendable {
             var specific: [Mode] = []
             var catchAll: [Mode] = []
             for mode in candidates {
-                let regex = try mode.compiledBundleIDRegex()
+                // An invalid bundle-ID pattern used to propagate out of here
+                // and abort the WHOLE resolution — one broken custom mode
+                // silently killed dictation everywhere. Skip just that mode,
+                // loudly (error log + ModeDiagnostics for Settings).
+                let regex: NSRegularExpression
+                do {
+                    regex = try mode.compiledBundleIDRegex()
+                    diagnostics.clear(modeID: mode.id, field: .bundleIDRegex)
+                } catch {
+                    diagnostics.report(
+                        ModePatternIssue(
+                            modeID: mode.id, modeName: mode.name, field: .bundleIDRegex,
+                            pattern: mode.bundleIDRegex,
+                            message: error.localizedDescription
+                        ))
+                    continue
+                }
                 let range = NSRange(bundleID.startIndex..., in: bundleID)
                 guard regex.firstMatch(in: bundleID, options: [], range: range) != nil else { continue }
                 if mode.bundleIDRegex == ".*" {

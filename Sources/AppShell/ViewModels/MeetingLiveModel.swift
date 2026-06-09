@@ -105,6 +105,26 @@ public final class MeetingLiveModel {
         case final
     }
 
+    /// The post-meeting finalisation lifecycle, distinct from `SummaryState`
+    /// (which tracks the text stream itself, including the in-meeting rolling
+    /// summary).
+    ///
+    /// Driven explicitly by `MeetingRuntime`'s finalisation task so the UI can
+    /// show "Finalising transcript… / Generating summary… / failed (retry)"
+    /// without the meeting feeling stuck after Stop. `.idle` for live capture
+    /// and for hydrated saved meetings.
+    public enum SummaryPhase: Sendable, Equatable {
+        case idle
+        /// Diarization refinement + title generation are running.
+        case preparing
+        /// Summary tokens are streaming in.
+        case generating
+        /// Generation failed; the associated message is user-facing and the view
+        /// offers a retry. Never silent.
+        case failed(String)
+        case done
+    }
+
     public private(set) var sessionId: String?
     public var title: String = ""
     public private(set) var startedAt: Date?
@@ -133,12 +153,28 @@ public final class MeetingLiveModel {
 
     public private(set) var liveSummary: String = ""
     public private(set) var summaryState: SummaryState = .none
+    public private(set) var summaryPhase: SummaryPhase = .idle
     public private(set) var health: Health = .idle
+
+    /// Loud, user-facing persistence problems (utterance writes, notes, summary,
+    /// session record) shown as warning banners — never log-only.
+    ///
+    /// De-duplicated
+    /// by message so a repeatedly-failing write surfaces once. Cleared when a new
+    /// meeting begins; individually dismissable.
+    public private(set) var storageNotices: [String] = []
 
     /// Non-fatal notice about the transcription engine actually in use — set when
     /// the chosen engine couldn't start and the app fell back to another one, so
     /// the user isn't silently downgraded. nil = running the chosen engine.
     public private(set) var engineNotice: String?
+
+    /// Non-fatal notice that the other side isn't being captured — set when the
+    /// system-audio tap is running but only yielding silence while audio is
+    /// playing out (the "permission not taking effect" case). Shown alongside
+    /// the live indicator so the user is never silently handed a mic-only
+    /// recording. nil = system audio is being captured (or nothing's wrong yet).
+    public private(set) var captureNotice: String?
 
     /// Per-session speaker rename map (`speakerID` → display name).
     public private(set) var speakerNames: [String: String] = [:]
@@ -207,7 +243,11 @@ public final class MeetingLiveModel {
 
     /// Reset to a fresh meeting.
     ///
-    /// Called by the runtime at capture start.
+    /// Called by the runtime at capture start. Everything belonging to the
+    /// previous session is dropped here — including the regenerate hook and any
+    /// in-flight regeneration flag, so a stale closure can never act on the new
+    /// meeting — and the session id change is what makes the runtime's
+    /// finalisation guards drop late writes from the previous meeting.
     public func begin(sessionId: String, title: String, startedAt: Date = Date()) {
         self.sessionId = sessionId
         self.title = title
@@ -218,10 +258,16 @@ public final class MeetingLiveModel {
         notes = ""
         liveSummary = ""
         summaryState = .none
+        summaryPhase = .idle
         speakerNames = [:]
         categorization = nil
         health = .capturing
         engineNotice = nil
+        captureNotice = nil
+        storageNotices = []
+        scrollTargetTime = nil
+        regenerateSummary = nil
+        isRegenerating = false
     }
 
     /// Surface (or clear) the post-finalize auto-categorization banner (BAS-9).
@@ -307,6 +353,37 @@ public final class MeetingLiveModel {
         summaryState = isFinal ? .final : .streaming
     }
 
+    /// Advance the post-meeting finalisation lifecycle shown in the AI Summary
+    /// header.
+    ///
+    /// Deliberately decoupled from `setSummary` — the in-meeting rolling
+    /// summary streams text without ever entering a finalisation phase.
+    public func setSummaryPhase(_ phase: SummaryPhase) {
+        summaryPhase = phase
+    }
+
+    /// Mark summary generation as failed with a plain, user-facing message.
+    ///
+    /// The view renders the message with a retry affordance — a failed summary
+    /// is never a silent ghost state.
+    public func setSummaryFailed(_ message: String) {
+        summaryPhase = .failed(message)
+    }
+
+    /// Surface a persistence failure as a visible warning banner.
+    ///
+    /// `notice` MUST be plain, human-facing sentence-case text (no raw error
+    /// strings). De-duplicated by message.
+    public func raiseStorageNotice(_ notice: String) {
+        guard !storageNotices.contains(notice) else { return }
+        storageNotices.append(notice)
+    }
+
+    /// Dismiss one storage notice (the banner's Dismiss button).
+    public func dismissStorageNotice(_ notice: String) {
+        storageNotices.removeAll { $0 == notice }
+    }
+
     public func setHealth(_ health: Health) {
         self.health = health
     }
@@ -316,6 +393,12 @@ public final class MeetingLiveModel {
     /// description. nil clears the pill.
     public func setEngineNotice(_ notice: String?) {
         self.engineNotice = notice
+    }
+
+    /// The notice is rendered verbatim as a status pill, so it MUST be plain,
+    /// human-facing sentence-case text. nil clears the pill.
+    public func setCaptureNotice(_ notice: String?) {
+        self.captureNotice = notice
     }
 
     /// Rename a speaker for this session.

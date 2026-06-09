@@ -20,7 +20,14 @@ import Foundation
 ///
 /// Cancellation: any non-terminal state can transition to `cancelled` via
 /// `cancel()`. The controller drops audio capture, swallows any pending ASR
-/// deltas, and skips paste.
+/// deltas, discards the crash-recovery spool, and skips paste.
+///
+/// Start epochs: a stop/cancel that lands while a start is still in flight
+/// (model downloading, runtime building, mode resolving) must kill that
+/// pending start instead of letting it become a zombie recording. Callers mint
+/// a token with `currentEpoch()`/`invalidatePendingStarts()` and pass it to
+/// `startCapture(mode:epoch:)`; any stale token aborts with
+/// `DictationStartError.cancelledBeforeStart`.
 public actor DictationController {
     public enum CaptureMode: Sendable, Hashable, Codable {
         /// Recording stops when the caller invokes `stopCapture()`.
@@ -41,6 +48,13 @@ public actor DictationController {
     private var pendingTranscriptStream: AsyncStream<ASRDelta>?
     private var startedAt: TimeInterval = 0
     private var idForCycle: String = ""
+    /// Start-intent epoch. Bumped by `invalidatePendingStarts()` and `cancel()`
+    /// so a `startCapture(mode:epoch:)` carrying a stale token aborts instead
+    /// of zombie-recording after the user already said stop.
+    private var startEpoch: UInt64 = 0
+    /// Ceiling on how long a queued start will wait for the previous cycle's
+    /// tail (finalising → cleaning → pasting) before failing loudly.
+    private static let chainWaitCeiling: Duration = .seconds(20)
 
     public init(
         dependencies: any PipelineDependencies,
@@ -54,28 +68,67 @@ public actor DictationController {
         await stateMachine.state
     }
 
+    // MARK: - Start epochs
+
+    /// The current start-intent epoch.
+    ///
+    /// Mint a token with this before kicking
+    /// off the (possibly slow) path to `startCapture`, then pass it as the
+    /// `epoch:` argument — a stop/cancel in between bumps the epoch and the
+    /// stale start aborts instead of zombie-recording.
+    public func currentEpoch() -> UInt64 {
+        startEpoch
+    }
+
+    /// Invalidates every start currently in flight (or queued behind a
+    /// previous cycle's tail): any `startCapture(mode:epoch:)` holding an
+    /// older token aborts with `DictationStartError.cancelledBeforeStart`.
+    ///
+    /// Returns the new epoch, usable as the token for a subsequent start.
+    @discardableResult
+    public func invalidatePendingStarts() -> UInt64 {
+        startEpoch &+= 1
+        return startEpoch
+    }
+
     /// Starts a capture cycle.
     ///
     /// Caller selects push-to-talk or toggle. The
     /// controller resolves the mode from the frontmost-app provider and kicks
     /// off audio + ASR streaming. The call returns immediately; callers
     /// observe the state machine and `runOneCycle(_:)` for the final result.
-    public func startCapture(mode: CaptureMode) async throws {
+    ///
+    /// If the previous cycle's tail (finalising → cleaning → pasting) is still
+    /// running, the new start CHAINS: it suspends — event-driven, no polling —
+    /// and begins the instant the tail completes. If the tail outlives a
+    /// generous ceiling the start fails loudly with
+    /// `DictationStartError.busyFinishingPrevious` (never a silent discard).
+    ///
+    /// `epoch` is the optional start-intent token (see `currentEpoch()`); a
+    /// stale token aborts with `DictationStartError.cancelledBeforeStart`.
+    public func startCapture(mode: CaptureMode, epoch: UInt64? = nil) async throws {
+        let myEpoch = epoch ?? startEpoch
+        guard myEpoch == startEpoch else { throw DictationStartError.cancelledBeforeStart }
+
         var current = await stateMachine.state
         if current != .idle {
-            // A previous dictation's tail (finalizing → cleaning → pasting) may
-            // still be running when the user starts the next one — especially
-            // with LLM cleanup, which takes seconds. Rather than DROP the new
-            // dictation, wait briefly for that cycle to finish, then proceed.
-            // (An active .recording is still rejected — the toggle stops it, it
-            // doesn't start a second capture.)
+            // A previous dictation's tail may still be running when the user
+            // starts the next one — especially with LLM cleanup, which takes
+            // seconds. Chain onto it rather than dropping the new dictation.
+            // (An active .recording is still rejected — the toggle stops it,
+            // it doesn't start a second capture.)
             if !current.isTerminal, current != .recording {
-                let deadline = dependencies.now() + 8.0
-                while current != .idle, !current.isTerminal, dependencies.now() < deadline {
-                    try? await Task.sleep(nanoseconds: 60_000_000)
-                    current = await stateMachine.state
+                guard let settled = await stateMachine.waitForQuiescence(timeout: Self.chainWaitCeiling)
+                else {
+                    Loggers.dictation.error(
+                        "startCapture: previous cycle still finishing after the chain ceiling — failing loudly"
+                    )
+                    throw DictationStartError.busyFinishingPrevious
                 }
+                current = settled
             }
+            // A stop/cancel may have arrived while we were chained.
+            guard myEpoch == startEpoch else { throw DictationStartError.cancelledBeforeStart }
             if current.isTerminal {
                 try await stateMachine.resetToIdle()
             } else if current != .idle {
@@ -92,19 +145,36 @@ public actor DictationController {
 
         do {
             resolvedMode = try await dependencies.modeResolver.resolveCurrent()
+            try checkEpochStillCurrent(myEpoch)
             try await dependencies.asr.beginCycle()
+            try checkEpochStillCurrent(myEpoch)
             try await dependencies.audio.startCapture()
+            try checkEpochStillCurrent(myEpoch)
             try await stateMachine.transition(to: .recording)
             Loggers.dictation.info(
                 "capture started mode=\(self.resolvedMode?.name ?? "?", privacy: .public) ptt=\(mode == .pushToTalk, privacy: .public)"
             )
         } catch {
             await dependencies.audio.stopCapture()
+            await dependencies.asr.cancelCycle()
+            if error is DictationStartError {
+                // A cancel raced the arming sequence. `cancel()` usually drove
+                // the machine to .cancelled already; if not, do it here. Either
+                // way this is a cancellation, not a failure.
+                try? await stateMachine.transition(to: .cancelled)
+                throw error
+            }
             try? await stateMachine.transition(
                 to: .failed(reason: failureReason(for: error, fallback: .audioCaptureFailed))
             )
             throw error
         }
+    }
+
+    /// Throws `DictationStartError.cancelledBeforeStart` when a stop/cancel
+    /// bumped the epoch while the arming sequence was suspended at an await.
+    private func checkEpochStillCurrent(_ epoch: UInt64) throws {
+        guard epoch == startEpoch else { throw DictationStartError.cancelledBeforeStart }
     }
 
     /// Issued by the hotkey-up handler (PTT) or by the VAD endpoint
@@ -167,7 +237,7 @@ public actor DictationController {
         do {
             let outcome = try await dependencies.paste.insert(cleanedText, behavior: mode.insertBehavior)
             pasteResult = outcome
-            pasted = outcome != .copiedOnly
+            pasted = outcome.didInsert
         } catch {
             try? await stateMachine.transition(to: .failed(reason: .pasteFailed))
             await persistFailedRecord(
@@ -261,14 +331,20 @@ public actor DictationController {
         }
     }
 
-    /// Cancels the current cycle.
+    /// Cancels the current cycle (Esc, hotkey abort, runOneCycle timeout).
     ///
-    /// No-op if already terminal.
+    /// Stops audio, tells the ASR adapter to abandon its cycle — dropping
+    /// buffered samples AND discarding the crash-recovery spool, since the
+    /// user deliberately binned this recording — and bumps the start epoch so
+    /// any start still in flight aborts too. No-op if already terminal.
     public func cancel() async {
+        startEpoch &+= 1
         let current = await stateMachine.state
         guard !current.isTerminal else { return }
         await dependencies.audio.stopCapture()
+        await dependencies.asr.cancelCycle()
         try? await stateMachine.transition(to: .cancelled)
+        Loggers.dictation.info("dictation cancelled from state \(String(describing: current), privacy: .public)")
     }
 
     /// Records the bundle ID resolved before mode lookup.
@@ -353,4 +429,18 @@ public actor DictationController {
         }
         return String(t)
     }
+}
+
+/// Honest, matchable outcomes for a `startCapture` that never became a
+/// recording. Callers surface BOTH distinctly in the HUD — neither may be
+/// silently swallowed.
+public enum DictationStartError: Error, Sendable, Equatable {
+    /// A stop/cancel invalidated this start's epoch before (or while) it was
+    /// arming — the user changed their mind; show nothing or "Cancelled",
+    /// never "listening".
+    case cancelledBeforeStart
+    /// The previous dictation's tail (transcribe → clean → paste) was still
+    /// running when the chain-wait ceiling expired. Surface "Still finishing
+    /// the previous dictation" — never silently drop the new one.
+    case busyFinishingPrevious
 }

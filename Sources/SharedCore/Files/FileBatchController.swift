@@ -42,6 +42,11 @@ public actor FileBatchController {
     private let folderResolver: @Sendable (FileBatchJob) -> ProjectFolderResolution
     private var runTask: Task<Void, Never>?
     private var isRunning = false
+    private var didRunCrashRecovery = false
+
+    /// How many times a crashed-out job is re-queued before being abandoned —
+    /// the file itself may be what crashes the app.
+    public static let maxRecoveryAttempts = 3
 
     public init(
         queue: FileBatchQueue,
@@ -132,7 +137,10 @@ public actor FileBatchController {
     ///
     /// Calling
     /// `enqueue` later wakes the loop again only if it has finished. Designed
-    /// for a single supervisor at any time.
+    /// for a single supervisor at any time. The first run also performs crash
+    /// recovery (`recoverInterruptedJobs`) so rows a previous process left
+    /// stuck in a non-terminal status get retried even when the controller was
+    /// constructed lazily.
     public func startRunLoop(
         locale: Locale = .current,
         summarization: FileBatchSummarization? = nil
@@ -140,9 +148,80 @@ public actor FileBatchController {
         guard !isRunning else { return }
         isRunning = true
         runTask = Task { [self] in
+            if !didRunCrashRecovery {
+                do {
+                    _ = try await self.recoverInterruptedJobs()
+                } catch {
+                    Loggers.files.error(
+                        "Crash recovery for interrupted file jobs failed: \(String(describing: error), privacy: .public)"
+                    )
+                }
+            }
             await self.runUntilDrained(locale: locale, summarization: summarization)
             self.markStopped()
         }
+    }
+
+    // MARK: Crash recovery
+
+    /// Outcome of `recoverInterruptedJobs` — what was re-queued and what was
+    /// abandoned (marked failed after too many interrupted attempts).
+    public struct RecoveryReport: Sendable, Equatable {
+        public var requeued: [UUID] = []
+        public var abandoned: [UUID] = []
+        public init() {}
+    }
+
+    /// Re-queue jobs a previous process left stuck in a non-terminal status
+    /// (the in-memory queue dies with the process; without this, a crash mid-
+    /// transcription showed "Transcribing…" forever and never retried).
+    ///
+    /// Rows already interrupted `maxRecoveryAttempts` times are marked failed
+    /// with a clear, user-visible reason instead — the file itself may be what
+    /// crashes the app. Idempotent within one controller lifetime; call it at
+    /// boot (then `startRunLoop()` if it reports re-queued jobs).
+    @discardableResult
+    public func recoverInterruptedJobs(
+        maxAttempts: Int = FileBatchController.maxRecoveryAttempts
+    ) async throws -> RecoveryReport {
+        var report = RecoveryReport()
+        guard !didRunCrashRecovery else { return report }
+        didRunCrashRecovery = true
+
+        for record in try await repository.nonTerminalRecords() {
+            guard let id = UUID(uuidString: record.id) else { continue }
+            let job = FileBatchJob(
+                id: id,
+                sourceURL: URL(fileURLWithPath: record.sourcePath),
+                kind: record.kind,
+                origin: record.origin,
+                projectID: record.projectID
+            )
+            let attempts = try await repository.recoveryAttempts(id: id)
+            if attempts >= maxAttempts {
+                let reason =
+                    "Processing was interrupted \(attempts + 1) times (the app quit mid-job). "
+                    + "Giving up on automatic retries — use Retry to try again manually."
+                try await repository.markFailed(
+                    id: id,
+                    failure: FileBatchFailure(stage: record.status, reason: reason)
+                )
+                await processingState.record(job: job, status: .failed, errorReason: reason)
+                report.abandoned.append(id)
+                Loggers.files.error(
+                    "Abandoned interrupted job \(id.uuidString, privacy: .public) after \(attempts) recovery attempt(s)"
+                )
+                continue
+            }
+            try await repository.markRequeuedForRecovery(id: id)
+            await queue.tryEnqueue(job)
+            await processingState.record(job: job, status: .queued)
+            report.requeued.append(id)
+            Loggers.files.info(
+                "Re-queued interrupted job \(id.uuidString, privacy: .public) (attempt \(attempts + 1))"
+            )
+        }
+        return report
     }
 
     /// Wait for the current run loop iteration to finish, if any.
@@ -250,13 +329,32 @@ public actor FileBatchController {
     private func applyFailure(job: FileBatchJob, error: TraceError) async {
         let stage = inferFailureStage(job: job, error: error)
         let failure = FileBatchFailure(stage: stage, reason: error.localizedDescription)
-        do {
-            try await repository.markFailed(id: job.id, failure: failure)
-        } catch {
-            Loggers.files.error("markFailed failed: \(String(describing: error), privacy: .public)")
+        // The DB write and the UI snapshot must agree: if the write fails the
+        // row stays in a non-terminal status while the UI shows "failed", and
+        // nothing ever reconciles them within this session. Retry once
+        // (transient lock contention is the usual cause); if it still fails,
+        // say so in the surfaced reason — start-up recovery will re-queue the
+        // stuck row on next launch, so the user knows what to expect.
+        var persistFailure: (any Error)?
+        for _ in 0..<2 {
+            do {
+                try await repository.markFailed(id: job.id, failure: failure)
+                persistFailure = nil
+                break
+            } catch {
+                persistFailure = error
+            }
+        }
+        var surfacedReason = error.localizedDescription
+        if let persistFailure {
+            Loggers.files.error(
+                "markFailed could not be persisted for \(job.id.uuidString, privacy: .public): \(String(describing: persistFailure), privacy: .public)"
+            )
+            surfacedReason +=
+                " (this failure could not be saved — the job will be retried automatically on next launch)"
         }
         await processingState.record(
-            job: job, status: .failed, errorReason: error.localizedDescription
+            job: job, status: .failed, errorReason: surfacedReason
         )
         Loggers.files.error(
             "Job \(job.id.uuidString, privacy: .public) failed at \(stage.rawValue, privacy: .public): \(error.localizedDescription, privacy: .public)"

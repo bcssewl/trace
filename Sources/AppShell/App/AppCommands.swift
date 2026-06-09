@@ -119,6 +119,12 @@ extension Notification.Name {
     public static let traceCoachAsk = Notification.Name("app.trace.coachAsk")
     /// Posted to surface the Library search pane (⌘K) and focus its field.
     public static let traceOpenSearch = Notification.Name("app.trace.openSearch")
+    /// Posted to open the in-window Settings takeover at a specific tab. The
+    /// target tab travels via `AppStateModel.pendingSettingsTab` (not the
+    /// notification payload) so a Settings view that mounts *after* the post —
+    /// the takeover flips selection first — still finds it waiting. Used by
+    /// notice-banner recovery buttons ("Open Settings → AI models").
+    public static let traceOpenSettingsTab = Notification.Name("app.trace.openSettingsTab")
     /// Posted to open a meeting in the content pane, optionally seeking to a
     /// timestamp.
     ///

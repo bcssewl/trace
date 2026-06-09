@@ -205,6 +205,107 @@ final class FileBatchControllerTests: XCTestCase {
         XCTAssertLessThanOrEqual(highFinished, lowFinished)
     }
 
+    // MARK: Crash recovery
+
+    private func makeController(text: String = "recovered") -> FileBatchController {
+        FileBatchController(
+            queue: queue,
+            repository: repo,
+            transcriber: makeTranscriber(text: text),
+            markdown: markdown,
+            processingState: state,
+            folderResolver: FileBatchController.defaultFolderResolver()
+        )
+    }
+
+    func testRecoverInterruptedJobsRequeuesStuckRow() async throws {
+        // Simulate a crash mid-transcription: row stuck non-terminal, queue empty.
+        let job = sampleJob("stuck")
+        try await repo.insertQueued(job: job, engine: "stub:1")
+        try await repo.updateStatus(id: job.id, status: .transcribing)
+
+        let controller = makeController()
+        let report = try await controller.recoverInterruptedJobs()
+
+        XCTAssertEqual(report.requeued, [job.id])
+        XCTAssertTrue(report.abandoned.isEmpty)
+        let row = try await repo.fetch(id: job.id)
+        XCTAssertEqual(row?.status, .queued)
+        let queuedIds = await queue.snapshotIds()
+        XCTAssertEqual(queuedIds, [job.id])
+        let attempts = try await repo.recoveryAttempts(id: job.id)
+        XCTAssertEqual(attempts, 1)
+    }
+
+    func testRecoveredJobRunsToCompletion() async throws {
+        let job = sampleJob("stuck-then-done")
+        try await repo.insertQueued(job: job, engine: "stub:1")
+        try await repo.updateStatus(id: job.id, status: .summarizing)
+
+        let controller = makeController(text: "second time lucky")
+        _ = try await controller.recoverInterruptedJobs()
+        await controller.runUntilDrained()
+
+        let row = try await repo.fetch(id: job.id)
+        XCTAssertEqual(row?.status, .completed)
+        XCTAssertNotNil(row?.transcriptPath)
+    }
+
+    func testRecoveryAbandonsJobAfterMaxAttemptsWithClearReason() async throws {
+        let job = sampleJob("crash-loop")
+        try await repo.insertQueued(job: job, engine: "stub:1")
+        try await repo.updateStatus(id: job.id, status: .transcribing)
+        // Already re-queued the maximum number of times by previous launches.
+        for _ in 0..<FileBatchController.maxRecoveryAttempts {
+            try await repo.markRequeuedForRecovery(id: job.id)
+        }
+        try await repo.updateStatus(id: job.id, status: .transcribing)
+
+        let controller = makeController()
+        let report = try await controller.recoverInterruptedJobs()
+
+        XCTAssertEqual(report.abandoned, [job.id])
+        XCTAssertTrue(report.requeued.isEmpty)
+        let row = try await repo.fetch(id: job.id)
+        XCTAssertEqual(row?.status, .failed)
+        XCTAssertTrue(row?.errorReason?.contains("interrupted") == true)
+        XCTAssertTrue(row?.errorReason?.contains("Retry") == true, "reason must point at the manual Retry action")
+        let queuedIds = await queue.snapshotIds()
+        XCTAssertTrue(queuedIds.isEmpty)
+    }
+
+    func testRecoveryIgnoresTerminalRows() async throws {
+        let done = sampleJob("done")
+        try await repo.insertQueued(job: done, engine: "stub:1")
+        try await repo.markCompleted(id: done.id, transcriptPath: "/tmp/t.md", durationMs: 100)
+        let failed = sampleJob("failed")
+        try await repo.insertQueued(job: failed, engine: "stub:1")
+        try await repo.markFailed(
+            id: failed.id, failure: FileBatchFailure(stage: .transcribing, reason: "x"))
+
+        let controller = makeController()
+        let report = try await controller.recoverInterruptedJobs()
+
+        XCTAssertTrue(report.requeued.isEmpty)
+        XCTAssertTrue(report.abandoned.isEmpty)
+        let doneRow = try await repo.fetch(id: done.id)
+        XCTAssertEqual(doneRow?.status, .completed)
+    }
+
+    func testRecoveryRunsOnlyOncePerControllerLifetime() async throws {
+        let job = sampleJob("once")
+        try await repo.insertQueued(job: job, engine: "stub:1")
+        try await repo.updateStatus(id: job.id, status: .writing)
+
+        let controller = makeController()
+        let first = try await controller.recoverInterruptedJobs()
+        XCTAssertEqual(first.requeued.count, 1)
+        let second = try await controller.recoverInterruptedJobs()
+        XCTAssertTrue(second.requeued.isEmpty, "recovery is idempotent within one controller lifetime")
+        let attempts = try await repo.recoveryAttempts(id: job.id)
+        XCTAssertEqual(attempts, 1)
+    }
+
     func testSummarizationStageWritesSummarySection() async throws {
         let transcriber = makeTranscriber(text: "raw transcript text")
         let router = ScriptedModelRouter(scripted: [

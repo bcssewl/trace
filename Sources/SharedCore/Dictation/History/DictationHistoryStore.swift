@@ -23,13 +23,14 @@ public actor DictationHistoryStore {
         let inserted = record.inserted ? 1 : 0
         let durationMs = record.durationMs
         let startedAt = Int64(record.startedAt)
+        let recovered = record.recovered ? 1 : 0
 
         try await database.withStatement(
             sql: """
                 INSERT INTO dictations (
                     id, project_id, mode_name, bundle_id,
-                    raw_text, cleaned_text, inserted, duration_ms, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    raw_text, cleaned_text, inserted, duration_ms, started_at, recovered
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """
         ) { stmt in
             try stmt.bind(text: id, at: 1)
@@ -41,6 +42,7 @@ public actor DictationHistoryStore {
             try stmt.bind(int: inserted, at: 7)
             try stmt.bind(int: durationMs, at: 8)
             try stmt.bind(int64: startedAt, at: 9)
+            try stmt.bind(int: recovered, at: 10)
             _ = try stmt.step()
         }
     }
@@ -49,7 +51,7 @@ public actor DictationHistoryStore {
         try await database.withStatement(
             sql: """
                 SELECT id, project_id, mode_name, bundle_id, raw_text, cleaned_text,
-                       inserted, duration_ms, started_at
+                       inserted, duration_ms, started_at, recovered
                 FROM dictations
                 WHERE id = ?
                 """
@@ -71,7 +73,7 @@ public actor DictationHistoryStore {
         return try await database.withStatement(
             sql: """
                 SELECT id, project_id, mode_name, bundle_id, raw_text, cleaned_text,
-                       inserted, duration_ms, started_at
+                       inserted, duration_ms, started_at, recovered
                 FROM dictations
                 \(whereClause)
                 ORDER BY started_at DESC
@@ -95,9 +97,20 @@ public actor DictationHistoryStore {
     }
 
     public func delete(id: String) async throws {
-        try await database.withStatement(sql: "DELETE FROM dictations WHERE id = ?") { stmt in
-            try stmt.bind(text: id, at: 1)
-            _ = try stmt.step()
+        // Purge the keyword-search index row in the same transaction — without
+        // this a deleted dictation ghosts in search until the next launch
+        // reconcile sweeps it.
+        try await database.transaction {
+            try await database.withStatement(
+                sql: "DELETE FROM entry_fts WHERE source = 'dictation' AND item_id = ?"
+            ) { stmt in
+                try stmt.bind(text: id, at: 1)
+                _ = try stmt.step()
+            }
+            try await database.withStatement(sql: "DELETE FROM dictations WHERE id = ?") { stmt in
+                try stmt.bind(text: id, at: 1)
+                _ = try stmt.step()
+            }
         }
     }
 
@@ -116,6 +129,7 @@ public actor DictationHistoryStore {
         let inserted = stmt.columnInt(at: 6) != 0
         let durationMs = stmt.columnInt(at: 7)
         let startedAt = TimeInterval(stmt.columnInt64(at: 8))
+        let recovered = stmt.columnInt(at: 9) != 0
         return DictationRecord(
             id: id,
             projectID: projectID,
@@ -125,7 +139,8 @@ public actor DictationHistoryStore {
             cleanedText: cleanedText,
             inserted: inserted,
             durationMs: durationMs,
-            startedAt: startedAt
+            startedAt: startedAt,
+            recovered: recovered
         )
     }
 }

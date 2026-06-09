@@ -1,12 +1,136 @@
 @preconcurrency import AVFoundation
 import Foundation
 import Speech
+import os
+
+/// Retry/pacing policy for Apple Speech segment requests.
+///
+/// Long meetings fire one `SFSpeechRecognizer` request per speech segment;
+/// Apple throttles bursts and long sessions, and a throttled request used to
+/// hang until the long safety timeout and then be silently dropped. The policy
+/// is a plain value type so the backoff math and the rate-limit classification
+/// are unit-testable without touching the Speech framework.
+public struct AppleSpeechRetryPolicy: Sendable, Equatable {
+    /// Total tries per segment (1 initial + `maxAttempts - 1` retries).
+    public var maxAttempts: Int
+    /// Backoff before the first retry; doubles each retry after that.
+    public var initialBackoff: TimeInterval
+    public var backoffMultiplier: Double
+    public var maxBackoff: TimeInterval
+    /// Minimum spacing between consecutive request starts — modest pacing so a
+    /// burst of short segments doesn't trip the throttle in the first place.
+    public var minimumRequestGap: TimeInterval
+
+    public init(
+        maxAttempts: Int = 3,
+        initialBackoff: TimeInterval = 0.5,
+        backoffMultiplier: Double = 2,
+        maxBackoff: TimeInterval = 8,
+        minimumRequestGap: TimeInterval = 0.25
+    ) {
+        self.maxAttempts = max(1, maxAttempts)
+        self.initialBackoff = initialBackoff
+        self.backoffMultiplier = backoffMultiplier
+        self.maxBackoff = maxBackoff
+        self.minimumRequestGap = minimumRequestGap
+    }
+
+    /// Delay before retry number `retry` (1-based: the first retry waits
+    /// `initialBackoff`, the second `initialBackoff * multiplier`, …), capped
+    /// at `maxBackoff`.
+    public func backoff(beforeRetry retry: Int) -> TimeInterval {
+        let exponent = max(0, retry - 1)
+        let raw = initialBackoff * pow(backoffMultiplier, Double(exponent))
+        return min(raw, maxBackoff)
+    }
+
+    /// Does this error look like a transient rate-limit/denial worth retrying?
+    ///
+    /// Apple doesn't document a stable error contract for throttling, so this
+    /// combines the one widely observed concrete case (kAFAssistantErrorDomain
+    /// code 203 "Retry") with a conservative wording heuristic. Anything else
+    /// (format failures, unsupported locale, cancellation) fails fast.
+    public static func isRetryable(_ error: Error) -> Bool {
+        let ns = error as NSError
+        if ns.domain == "kAFAssistantErrorDomain", ns.code == 203 {
+            return true
+        }
+        let pieces = [
+            ns.localizedDescription,
+            ns.localizedFailureReason ?? "",
+            (ns.userInfo[NSDebugDescriptionErrorKey] as? String) ?? "",
+        ]
+        let text = pieces.joined(separator: " ").lowercased()
+        let markers = ["rate limit", "rate-limit", "throttl", "too many", "busy", "retry", "overload"]
+        return markers.contains { text.contains($0) }
+    }
+}
+
+/// Process-wide FIFO gate for Apple Speech requests.
+///
+/// The meeting runtime resolves a SEPARATE backend instance per audio stream
+/// (mic + system), but Apple's throttle is system-wide — so serialisation and
+/// pacing must be shared across instances. One segment is recognised at a
+/// time, in submission order, with `minimumGap` between request starts.
+public final class AppleSpeechRequestGate: @unchecked Sendable {
+    public static let shared = AppleSpeechRequestGate()
+
+    private struct GateState: Sendable {
+        var tail: Task<Void, Never>?
+        var lastRequestStart: ContinuousClock.Instant?
+    }
+
+    private let state: OSAllocatedUnfairLock<GateState>
+
+    public init() {
+        self.state = OSAllocatedUnfairLock(initialState: GateState())
+    }
+
+    /// Run `body` once every previously enqueued request has finished and the
+    /// pacing gap has elapsed. Errors propagate to the caller; a failed
+    /// request never blocks the queue.
+    public func withTurn<T: Sendable>(
+        minimumGap: TimeInterval,
+        _ body: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        let stateLock = state
+        // Read the previous tail and append ourselves in ONE locked critical
+        // section so concurrent callers chain in submission order.
+        let work: Task<T, Error> = stateLock.withLock { gateState in
+            let previous = gateState.tail
+            let work = Task<T, Error> {
+                await previous?.value
+                // Pacing: keep request STARTS at least `minimumGap` apart.
+                if minimumGap > 0, let last = stateLock.withLock({ $0.lastRequestStart }) {
+                    let gap = Duration.seconds(minimumGap)
+                    let since = ContinuousClock.now - last
+                    if since < gap {
+                        try? await Task.sleep(for: gap - since)
+                    }
+                }
+                stateLock.withLock { $0.lastRequestStart = ContinuousClock.now }
+                return try await body()
+            }
+            gateState.tail = Task { _ = try? await work.value }
+            return work
+        }
+        return try await work.value
+    }
+}
 
 public actor AppleSpeechBackend: TranscriptionBackend {
     public nonisolated let displayName = "Apple Speech"
     private var preparedLocale: Locale?
+    private let policy: AppleSpeechRetryPolicy
+    private let gate: AppleSpeechRequestGate
 
-    public init() {}
+    public init(
+        policy: AppleSpeechRetryPolicy = AppleSpeechRetryPolicy(),
+        gate: AppleSpeechRequestGate = .shared
+    ) {
+        self.policy = policy
+        self.gate = gate
+    }
 
     public func checkStatus() async -> BackendStatus {
         switch SFSpeechRecognizer.authorizationStatus() {
@@ -36,6 +160,52 @@ public actor AppleSpeechBackend: TranscriptionBackend {
     public func transcribe(_ samples: [Float], locale: Locale, previousContext: String?) async throws -> String {
         // Apple Speech needs a concrete language; auto-detect falls back to system.
         let locale = locale.concreteOrCurrent
+        let policy = self.policy
+        // One Apple Speech request at a time, process-wide, modestly paced —
+        // with retry + exponential backoff on transient throttling, and a TYPED
+        // throw when the segment is finally dropped (never a silent loss): the
+        // pipeline's health callback turns that into "N segments lost".
+        return try await gate.withTurn(minimumGap: policy.minimumRequestGap) {
+            var attempt = 1
+            while true {
+                do {
+                    return try await Self.recognizeOnce(
+                        samples: samples, locale: locale, previousContext: previousContext)
+                } catch let error as TraceError {
+                    // Structural failures (unsupported locale, buffer alloc,
+                    // safety timeout) — not transient; fail fast.
+                    throw error
+                } catch {
+                    let retryable = AppleSpeechRetryPolicy.isRetryable(error)
+                    if retryable, attempt < policy.maxAttempts {
+                        let delay = policy.backoff(beforeRetry: attempt)
+                        Loggers.speech.warning(
+                            "AppleSpeech rate-limited/transient failure (attempt \(attempt, privacy: .public)/\(policy.maxAttempts, privacy: .public)); backing off \(delay, privacy: .public)s: \(error.localizedDescription, privacy: .public)"
+                        )
+                        try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                        attempt += 1
+                        continue
+                    }
+                    if retryable {
+                        throw TraceError.asrInferenceFailed(
+                            engine: "apple-speech",
+                            reason:
+                                "rate-limited — segment dropped after \(attempt) attempts: \(error.localizedDescription)"
+                        )
+                    }
+                    throw TraceError.asrInferenceFailed(
+                        engine: "apple-speech", reason: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// One recognition attempt. Throws the recognizer's RAW error (so the
+    /// retry policy can classify it) for recognition failures, and `TraceError`
+    /// for structural problems that no retry can fix.
+    private static func recognizeOnce(
+        samples: [Float], locale: Locale, previousContext: String?
+    ) async throws -> String {
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             throw TraceError.asrInferenceFailed(
                 engine: "apple-speech", reason: "recognizer unavailable for \(locale.identifier)")
@@ -82,9 +252,9 @@ public actor AppleSpeechBackend: TranscriptionBackend {
                     Loggers.speech.error(
                         "AppleSpeech.transcribe error: \(error.localizedDescription, privacy: .public)"
                     )
-                    once.resume(
-                        throwing: TraceError.asrInferenceFailed(
-                            engine: "apple-speech", reason: error.localizedDescription))
+                    // Throw the RAW error — the retry loop classifies it for
+                    // rate-limit backoff before mapping to TraceError.
+                    once.resume(throwing: error)
                     return
                 }
                 if let result, result.isFinal {

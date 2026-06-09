@@ -11,6 +11,24 @@ public actor SqliteDatabase {
     private let url: URL
     private var closed = false
 
+    // MARK: Transaction state
+
+    /// The databases the *current task* holds an open transaction on.
+    ///
+    /// Actor
+    /// reentrancy means `transaction { await … }` can interleave with other tasks'
+    /// calls; this task-local lets a nested `transaction` call from the SAME task
+    /// tree flatten onto a SAVEPOINT, while an unrelated task's `transaction`
+    /// queues behind the open one instead of corrupting it with a second BEGIN.
+    @TaskLocal private static var openTransactionDBs: Set<ObjectIdentifier> = []
+
+    /// Whether some task currently holds the outer BEGIN…COMMIT.
+    private var transactionHeld = false
+    /// FIFO queue of tasks waiting to start their own outer transaction.
+    private var transactionWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Monotonic counter so nested SAVEPOINT names never collide.
+    private var savepointSeq: UInt64 = 0
+
     private init(handle: OpaquePointer, url: URL) {
         self.handle = handle
         self.url = url
@@ -55,7 +73,12 @@ public actor SqliteDatabase {
 
     private func configurePragmas() throws {
         try execInternal("PRAGMA journal_mode = WAL")
-        try execInternal("PRAGMA synchronous = NORMAL")
+        // FULL (not NORMAL): this database is primary content — meetings index,
+        // FTS search, file-job state. NORMAL in WAL mode can lose the most recent
+        // commits on an OS crash / power cut; FULL fsyncs the WAL on every commit.
+        // The cost is a slower commit (one extra fsync), which is irrelevant at
+        // this app's write rate (a few rows per utterance/notes save).
+        try execInternal("PRAGMA synchronous = FULL")
         try execInternal("PRAGMA foreign_keys = ON")
         try execInternal("PRAGMA temp_store = MEMORY")
         try execInternal("PRAGMA cache_size = -20000")
@@ -124,15 +147,78 @@ public actor SqliteDatabase {
         preparedCache.count
     }
 
-    public func transaction<T>(_ body: () async throws -> T) async throws -> T {
-        try execInternal("BEGIN IMMEDIATE")
+    /// Run `body` atomically.
+    ///
+    /// Re-entrancy safe:
+    /// - A nested `transaction` call from within `body` (same task) flattens onto
+    ///   a SAVEPOINT — its failure rolls back only its own work, and the outer
+    ///   COMMIT makes everything durable at once.
+    /// - A `transaction` call from an unrelated task while one is open *queues*
+    ///   (FIFO) until the open one commits or rolls back, instead of issuing a
+    ///   second BEGIN that would corrupt both.
+    ///
+    /// Unsupported misuse — calling `transaction` from a *detached/child* task
+    /// spawned inside `body` and awaited by `body` — would self-deadlock; nested
+    /// transactions must run on the body's own task. SQLite itself fails loudly
+    /// ("cannot start a transaction within a transaction") if BEGIN is ever
+    /// issued manually around this API.
+    public func transaction<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+        let me = ObjectIdentifier(self)
+        if Self.openTransactionDBs.contains(me) {
+            // Nested in this task's open transaction → flatten via SAVEPOINT.
+            savepointSeq &+= 1
+            let name = "trace_sp_\(savepointSeq)"
+            try execInternal("SAVEPOINT \(name)")
+            do {
+                let result = try await body()
+                try execInternal("RELEASE SAVEPOINT \(name)")
+                return result
+            } catch {
+                try? execInternal("ROLLBACK TO SAVEPOINT \(name)")
+                try? execInternal("RELEASE SAVEPOINT \(name)")
+                throw error
+            }
+        }
+
+        await acquireTransactionLock()
         do {
-            let result = try await body()
+            try execInternal("BEGIN IMMEDIATE")
+        } catch {
+            releaseTransactionLock()
+            throw error
+        }
+        var owned = Self.openTransactionDBs
+        owned.insert(me)
+        do {
+            let result = try await Self.$openTransactionDBs.withValue(owned) {
+                try await body()
+            }
             try execInternal("COMMIT")
+            releaseTransactionLock()
             return result
         } catch {
             try? execInternal("ROLLBACK")
+            releaseTransactionLock()
             throw error
+        }
+    }
+
+    /// FIFO admission for the single outer transaction slot.
+    private func acquireTransactionLock() async {
+        if !transactionHeld {
+            transactionHeld = true
+            return
+        }
+        await withCheckedContinuation { transactionWaiters.append($0) }
+        // Resumed by releaseTransactionLock — ownership was handed to us
+        // (transactionHeld stays true across the hand-off).
+    }
+
+    private func releaseTransactionLock() {
+        if transactionWaiters.isEmpty {
+            transactionHeld = false
+        } else {
+            transactionWaiters.removeFirst().resume()
         }
     }
 

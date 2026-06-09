@@ -93,6 +93,67 @@ final class BurstDecayThrottleTests: XCTestCase {
     }
 }
 
+/// Pins the documented relationships between the pipeline's tuning constants
+/// (CoachThresholds) so a future retune that breaks an invariant fails a test
+/// pointing at the explanation, instead of silently changing behaviour.
+final class CoachThresholdsTests: XCTestCase {
+    /// Relationship 1: the no-regex attention gate is stricter than the router's
+    /// synthesizable floor — the [floor, gate) band is reachable only when a
+    /// regex marker or manual trigger already justified the LLM call.
+    func testAttentionGateIsAtLeastAsStrictAsSynthesizableFloor() {
+        XCTAssertGreaterThanOrEqual(
+            CoachThresholds.ragAttentionMinCosine, CoachThresholds.synthesizableMinCosine)
+    }
+
+    /// Relationship 2: verbatim grounded surfacing demands a much stronger match
+    /// than synthesis.
+    func testStrongGroundedIsStricterThanAttentionGate() {
+        XCTAssertGreaterThan(
+            CoachThresholds.strongGroundedCosine, CoachThresholds.ragAttentionMinCosine)
+    }
+
+    /// Relationship 3: burst weights sum to 1 so the score stays in [0, 1] and
+    /// the tier cutoffs are absolute.
+    func testBurstWeightsSumToOne() {
+        XCTAssertEqual(
+            CoachThresholds.burstQuestionWeight + CoachThresholds.burstKbWeight, 1.0,
+            accuracy: 0.0001)
+    }
+
+    /// Derived fact: KB relevance alone (even a perfect 1.0 match) can never make
+    /// an utterance "hot" — zero-spacing is reserved for question moments.
+    func testKbRelevanceAloneCannotReachHotTier() {
+        let score = BurstDecayThrottle.burstScore(questionDensity: 0, kbRelevance: 1.0)
+        XCTAssertLessThan(score, CoachThresholds.burstHotThreshold)
+        XCTAssertEqual(BurstDecayThrottle.tier(forBurstScore: score), .medium)
+    }
+
+    /// Derived fact: a bare question with no KB signal is cold-tier (12 s
+    /// spacing) — questions only get urgent when the knowledge base lights up.
+    func testQuestionAloneIsColdTier() {
+        let score = BurstDecayThrottle.burstScore(questionDensity: 1.0, kbRelevance: 0)
+        XCTAssertLessThan(score, CoachThresholds.burstMediumThreshold)
+        XCTAssertEqual(BurstDecayThrottle.tier(forBurstScore: score), .cold)
+    }
+
+    /// Derived fact: a question + a strong grounded hit is comfortably hot — the
+    /// moment the coach exists for surfaces with zero spacing.
+    func testQuestionWithStrongGroundedHitIsHotTier() {
+        let score = BurstDecayThrottle.burstScore(
+            questionDensity: 1.0, kbRelevance: Double(CoachThresholds.strongGroundedCosine))
+        XCTAssertGreaterThan(score, CoachThresholds.burstHotThreshold)
+        XCTAssertEqual(BurstDecayThrottle.tier(forBurstScore: score), .hot)
+    }
+
+    /// The legacy public constants forward to CoachThresholds — the single home —
+    /// so tuning there is tuning everywhere.
+    func testLegacyConstantsForwardToCoachThresholds() {
+        XCTAssertEqual(EmbeddingDetector.topicShiftCosineThreshold, CoachThresholds.topicShiftCosine)
+        XCTAssertEqual(AppleFmSmartRouter.strongGroundedCosine, CoachThresholds.strongGroundedCosine)
+        XCTAssertEqual(AppleFmSmartRouter.synthesizableMinCosine, CoachThresholds.synthesizableMinCosine)
+    }
+}
+
 actor CountingEmbeddingProvider: EmbeddingProvider {
     nonisolated let embeddingKind: EmbeddingProviderKind = .ollama
     var calls = 0
@@ -130,6 +191,12 @@ final class CoachConfigCodableTests: XCTestCase {
     /// decode — defaulting the new field to true and preserving every legacy
     /// field — rather than throwing and silently resetting the user's whole
     /// Coach config to defaults.
+    ///
+    /// NOTE the `"pacing"` key in the fixture: it is a DEAD key from the removed
+    /// live-pacing mode (the owner cut pacing/talk-time coaching entirely). It is
+    /// kept here deliberately — a real persisted config from that era contains
+    /// it, and the tolerant decoder must keep ignoring it forever. The explicit
+    /// contract is pinned by `testUnknownKeysAreIgnoredOnPurpose` below.
     func testDecodesLegacyJSONWithoutConversationStateField() throws {
         let legacy = """
             {"enabled":true,"surfaceBudget":5,"adaptiveThrottle":false,"antiFabricationPostCheck":true,
@@ -143,6 +210,27 @@ final class CoachConfigCodableTests: XCTestCase {
         XCTAssertFalse(cfg.adaptiveThrottle)
         XCTAssertTrue(cfg.antiFabricationPostCheck)
         XCTAssertFalse(cfg.modes.grounded)
+    }
+
+    /// The contract the legacy fixture above relies on, stated explicitly:
+    /// unknown keys — both top-level and inside `modes` — are ignored ON
+    /// PURPOSE. That's what lets a config written by an older build (with since-
+    /// removed features like the pacing mode) or a NEWER build (with fields this
+    /// build doesn't know yet) decode cleanly instead of resetting the user's
+    /// Coach config. Known fields must decode unaffected by the strangers
+    /// around them.
+    func testUnknownKeysAreIgnoredOnPurpose() throws {
+        let json = """
+            {"enabled":true,"surfaceBudget":3,"someFutureTopLevelKey":42,
+             "modes":{"grounded":true,"synthesized":false,"general":true,"reframe":true,"agenda":true,
+                      "pacing":true,"someFutureMode":false}}
+            """
+        let cfg = try JSONDecoder().decode(CoachConfig.self, from: Data(json.utf8))
+        XCTAssertTrue(cfg.enabled)
+        XCTAssertEqual(cfg.surfaceBudget, 3)
+        XCTAssertTrue(cfg.modes.grounded)
+        XCTAssertFalse(cfg.modes.synthesized, "known mode values must survive unknown siblings")
+        XCTAssertTrue(cfg.modes.agenda)
     }
 
     func testConversationStateEnabledRoundTrips() throws {

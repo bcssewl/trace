@@ -200,6 +200,22 @@ final class FileRepositoryTests: XCTestCase {
         XCTAssertNil(row)
     }
 
+    func testDeleteAlsoRemovesEntryFtsRowSoSearchCannotGhost() async throws {
+        let job = sampleJob()
+        try await repo.insertQueued(job: job, engine: "p")
+        try await db.exec(
+            sql: """
+                INSERT INTO entry_fts (item_id, source, project_id, title, started_at, sig, text)
+                VALUES ('\(job.id.uuidString)', 'file', NULL, 'clip', 0, 'sig', 'searchable transcript text')
+                """)
+
+        try await repo.delete(id: job.id)
+
+        let ftsCount = try await db.scalarInt(
+            sql: "SELECT COUNT(*) FROM entry_fts WHERE item_id = '\(job.id.uuidString)'")
+        XCTAssertEqual(ftsCount, 0, "deleting a file must purge its keyword-search row")
+    }
+
     func testSourcePathsPresentReturnsOnlyExisting() async throws {
         let job = sampleJob("a")  // /tmp/a.m4a
         try await repo.insertQueued(job: job, engine: "p")
