@@ -1,100 +1,75 @@
 import Foundation
-import SharedCore
 
-public enum CoachCardMode: String, Sendable, Codable, Hashable, CaseIterable {
-    case grounded
-    case synthesized
-    case general
-    case reframe
-    case agenda
-    case silent
+/// What kind of help a coach card offers.
+///
+/// The three kinds mirror the listener's
+/// output contract exactly (`{"action":"card","kind":…}`):
+///
+/// - `answer`: answers the question on the table — from the user's notes, from
+///   earlier in this meeting, or from the model's own general knowledge.
+/// - `recall`: resurfaces a relevant fact / commitment / detail from the user's
+///   notes or from earlier in this meeting.
+/// - `suggestion`: a concrete thing the user could say next.
+public enum CoachCardKind: String, Sendable, Codable, Hashable, CaseIterable {
+    case answer
+    case recall
+    case suggestion
 }
 
-public enum CoachCardSurface: String, Sendable, Codable, Hashable {
-    case passive
-    case interactive
-}
-
+/// One surfaced coach card.
+///
+/// `grounding` carries a short verbatim quote from
+/// the supplied notes when the card draws on them — shown on the card so the
+/// user can see exactly what it is standing on. Empty for cards built from the
+/// live transcript or the model's general knowledge (those are visually marked
+/// as such instead).
 public struct CoachCard: Sendable, Hashable, Identifiable {
     public let id: UUID
-    public let mode: CoachCardMode
+    public let kind: CoachCardKind
+    /// Short context label (what this card is about).
     public let title: String
-    /// One short "say this" line — the glanceable headline the overlay accents.
-    ///
-    /// Prefer this over `body`; falls back to `body` when empty (back-compat).
-    public let lead: String
-    /// ≤3 short supporting bullets (key facts / angles).
-    public let points: [String]
+    /// The card text the user reads at a glance (≤ a few sentences).
     public let body: String
-    public let attribution: String
-    public let surface: CoachCardSurface
-    public let burstScore: Double
-    public let sourceChunkIds: [String]
+    /// Verbatim quote from the supplied notes, or empty when the card is
+    /// transcript-derived / general knowledge.
+    public let grounding: String
     public let createdAt: Date
 
     public init(
         id: UUID = UUID(),
-        mode: CoachCardMode,
+        kind: CoachCardKind,
         title: String,
-        lead: String = "",
-        points: [String] = [],
-        body: String = "",
-        attribution: String,
-        surface: CoachCardSurface,
-        burstScore: Double,
-        sourceChunkIds: [String] = [],
+        body: String,
+        grounding: String = "",
         createdAt: Date = Date()
     ) {
         self.id = id
-        self.mode = mode
+        self.kind = kind
         self.title = title
-        self.lead = lead
-        self.points = points
         self.body = body
-        self.attribution = attribution
-        self.surface = surface
-        self.burstScore = burstScore
-        self.sourceChunkIds = sourceChunkIds
+        self.grounding = grounding
         self.createdAt = createdAt
     }
-}
 
-/// A directed on-demand "Ask the coach" request.
-///
-/// Each maps to a distinct prompt
-/// strategy in `SmartRouter`. Carried by a user-requested `CoachUtterance`; `nil`
-/// for passive auto-surfaced utterances (the default smart routing applies).
-public enum CoachIntent: String, Sendable, Codable, Hashable, CaseIterable {
-    /// Answer the question / point on the table (grounded if RAG hits, else general).
-    case answer
-    /// Force an objection-handling / persuasive reframe.
-    case reframe
-    /// A crisp, credible talking point to elevate what the user is saying.
-    case soundSmart
-    /// Verify the most recent salient claim via RAG + anti-fabrication checker.
-    case factCheck
-}
-
-public struct CoachUtterance: Sendable, Hashable {
-    public let speakerId: String
-    public let text: String
-    public let timestamp: Date
-    public let userRequested: Bool
-    /// When set, a directed "Ask the coach" request that steers the prompt; `nil`
-    /// for passive auto-surfaced utterances.
-    public let intent: CoachIntent?
-
-    public init(
-        speakerId: String,
-        text: String,
-        timestamp: Date = Date(),
-        userRequested: Bool = false,
-        intent: CoachIntent? = nil
-    ) {
-        self.speakerId = speakerId
-        self.text = text
-        self.timestamp = timestamp
-        self.userRequested = userRequested
-        self.intent = intent
+    /// Whether the card draws on the user's own notes (a grounding quote is
+    /// present).
+    public var isGrounded: Bool {
+        !grounding.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
+}
+
+/// A directed on-demand "Ask the coach" request (triple-tap / the Ask chips).
+///
+/// Each maps to an explicit directive in the listener's prompt; `nil` means an
+/// undirected manual ask ("help me with this moment").
+public enum CoachIntent: String, Sendable, Codable, Hashable, CaseIterable {
+    /// Answer the question / point on the table.
+    case answer
+    /// An objection-handling / persuasive reframe the user can say back.
+    case reframe
+    /// A crisp, credible talking point that elevates the current point.
+    case soundSmart
+    /// Check the most recent salient claim against the notes / transcript /
+    /// general knowledge.
+    case factCheck
 }

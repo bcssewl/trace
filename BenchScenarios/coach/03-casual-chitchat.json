@@ -1,0 +1,34 @@
+{
+  "name": "casual-chitchat",
+  "description": "Ten minutes of pleasant nothing while a client call is delayed — weekend plans, weather, tea orders. There is no live need a companion could help with; the only correct behaviour is silence at every check.",
+  "utterances": [
+    { "t": 0, "speaker": "Dana", "text": "They've pushed the client call by half an hour, so we're just hanging about." },
+    { "t": 25, "speaker": "You", "text": "Typical. More coffee for me, then." },
+    { "t": 50, "speaker": "Marcus", "text": "Anyone catch the weather for the weekend? Supposed to be lovely on Saturday." },
+    { "t": 75, "speaker": "Dana", "text": "Apparently, yeah. We're thinking of taking the kids to the coast." },
+    { "t": 100, "speaker": "You", "text": "Nice. We did Brighton a couple of weeks ago — the queue for chips was an hour long." },
+    { "t": 125, "speaker": "Marcus", "text": "An hour! For chips!" },
+    { "t": 150, "speaker": "Dana", "text": "Worth it though, I bet." },
+    { "t": 175, "speaker": "You", "text": "Honestly, yeah." },
+    { "t": 200, "speaker": "Marcus", "text": "Did you get up to much last night?" },
+    { "t": 225, "speaker": "You", "text": "Just the football and an early night. Riveting stuff." },
+    { "t": 250, "speaker": "Dana", "text": "I started that pottery class I kept going on about." },
+    { "t": 275, "speaker": "Marcus", "text": "How was it?" },
+    { "t": 300, "speaker": "Dana", "text": "I made what is technically a bowl. It wobbles." },
+    { "t": 325, "speaker": "You", "text": "A wobbly bowl is still a bowl." },
+    { "t": 350, "speaker": "Marcus", "text": "Words to live by." },
+    { "t": 375, "speaker": "Dana", "text": "Right, I'm grabbing a tea before they join. Anyone want anything?" },
+    { "t": 400, "speaker": "You", "text": "I'm alright, thanks." },
+    { "t": 425, "speaker": "Marcus", "text": "Go on then — builder's, splash of milk." },
+    { "t": 450, "speaker": "Dana", "text": "Two minutes." },
+    { "t": 475, "speaker": "You", "text": "I might stretch my legs as well." },
+    { "t": 500, "speaker": "Marcus", "text": "I'll hold the fort. If they join early I'll stall with my legendary small talk." },
+    { "t": 525, "speaker": "You", "text": "We've all witnessed the small talk. Stall gently." },
+    { "t": 550, "speaker": "Marcus", "text": "No promises." },
+    { "t": 575, "speaker": "Dana", "text": "Back. They said five more minutes." },
+    { "t": 600, "speaker": "You", "text": "Plenty of time for another biscuit, then." }
+  ],
+  "expect": [
+    { "type": "silence_throughout" }
+  ]
+}

@@ -1,100 +1,82 @@
 import Foundation
 
+/// The coach's behaviour config (persisted as JSON under
+/// `app.trace.coach.config`, and per-project in `projects.coach_config`).
+///
+/// The listener redesign deliberately removed the old knobs — the five mode
+/// toggles, the adaptive throttle, the anti-fabrication post-check, the
+/// conversation-state ticker settings, and the concurrency cap. Old persisted
+/// JSON still carrying those keys decodes cleanly (the tolerant decoder reads
+/// only the keys below and `JSONDecoder` ignores strangers).
 public struct CoachConfig: Sendable, Codable, Hashable {
     public var enabled: Bool
-    public var modes: ModeToggles
+    /// Rolling card allowance: at most this many automatically surfaced cards
+    /// within any trailing `surfaceWindowMinutes` window. The allowance refills
+    /// as the window slides, so a long meeting keeps getting help instead of
+    /// spending everything in the opening minutes (the old lifetime cap did
+    /// exactly that on real meetings). Manual asks (triple-tap / the Ask chips)
+    /// neither count against nor respect it.
     public var surfaceBudget: Int
-    public var adaptiveThrottle: Bool
-    public var antiFabricationPostCheck: Bool
-    /// Whether the conversation-state extractor runs during a meeting to feed the
-    /// coach smart-router live context (spec §5 stage; default on).
-    ///
-    /// Local/cloud
-    /// routing is governed separately by the `.conversationStateExtractor` model route.
-    public var conversationStateEnabled: Bool
-    /// How often (seconds) the conversation-state running summary refreshes.
-    ///
-    /// Default
-    /// 30 (spec §5/§407 "~30s"). A longer interval means fewer model calls — which
-    /// matters when the stage is routed to a paid cloud model.
-    public var conversationStateIntervalSeconds: Int
-    /// Maximum auto-cue pipelines analysing at once (each can hold several
-    /// model calls). When saturated, the newest utterance supersedes the one
-    /// waiting (latest-wins) and the skip is surfaced, never silent. Clamped to
-    /// 1…4 at the point of use.
-    public var maxConcurrentIngests: Int
+    /// The trailing window (minutes) the `surfaceBudget` allowance applies to.
+    /// Clamped to `minimumSurfaceWindowMinutes` at the point of use so a bad
+    /// persisted value can never collapse the window into "no budget at all".
+    public var surfaceWindowMinutes: Int
+    /// How often (seconds) the listener may run a check when new conversation
+    /// has arrived. Clamped to `minimumCheckCadenceSeconds` at the point of use
+    /// so a bad persisted value can never produce a per-utterance call storm.
+    public var checkCadenceSeconds: Int
     public var manualTrigger: ManualTriggerConfig
+
+    /// Floor for `checkCadenceSeconds` — each check is a paid cloud call.
+    public static let minimumCheckCadenceSeconds = 10
+
+    /// Floor for `surfaceWindowMinutes` — a zero/negative window would mean no
+    /// card ever counts against the budget.
+    public static let minimumSurfaceWindowMinutes = 1
+
+    /// `checkCadenceSeconds` with the safety floor applied.
+    public var effectiveCheckCadenceSeconds: Int {
+        max(Self.minimumCheckCadenceSeconds, checkCadenceSeconds)
+    }
+
+    /// `surfaceWindowMinutes` with the safety floor applied.
+    public var effectiveSurfaceWindowMinutes: Int {
+        max(Self.minimumSurfaceWindowMinutes, surfaceWindowMinutes)
+    }
 
     public init(
         enabled: Bool = true,
-        modes: ModeToggles = .default,
-        surfaceBudget: Int = 8,
-        adaptiveThrottle: Bool = true,
-        antiFabricationPostCheck: Bool = false,
-        conversationStateEnabled: Bool = true,
-        conversationStateIntervalSeconds: Int = 30,
-        maxConcurrentIngests: Int = 2,
+        surfaceBudget: Int = 4,
+        surfaceWindowMinutes: Int = 15,
+        checkCadenceSeconds: Int = 20,
         manualTrigger: ManualTriggerConfig = .default
     ) {
         self.enabled = enabled
-        self.modes = modes
         self.surfaceBudget = surfaceBudget
-        self.adaptiveThrottle = adaptiveThrottle
-        self.antiFabricationPostCheck = antiFabricationPostCheck
-        self.conversationStateEnabled = conversationStateEnabled
-        self.conversationStateIntervalSeconds = conversationStateIntervalSeconds
-        self.maxConcurrentIngests = maxConcurrentIngests
+        self.surfaceWindowMinutes = surfaceWindowMinutes
+        self.checkCadenceSeconds = checkCadenceSeconds
         self.manualTrigger = manualTrigger
     }
 
     private enum CodingKeys: String, CodingKey {
-        case enabled, modes, surfaceBudget, adaptiveThrottle
-        case antiFabricationPostCheck, conversationStateEnabled
-        case conversationStateIntervalSeconds, maxConcurrentIngests, manualTrigger
+        case enabled, surfaceBudget, surfaceWindowMinutes, checkCadenceSeconds, manualTrigger
     }
 
     /// Tolerant decoder: each field falls back to its default when absent, so a
-    /// config persisted by an older build (which predates a newer field like
-    /// `conversationStateEnabled`) upgrades cleanly instead of failing to decode
-    /// and silently resetting the user's entire Coach config to defaults.
+    /// config persisted by an older build (which had different fields — mode
+    /// toggles, throttle settings, the conversation-state ticker) upgrades
+    /// cleanly instead of failing to decode and silently resetting the user's
+    /// entire Coach config to defaults.
     public init(from decoder: any Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = CoachConfig()
         self.enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? d.enabled
-        self.modes = try c.decodeIfPresent(ModeToggles.self, forKey: .modes) ?? d.modes
         self.surfaceBudget = try c.decodeIfPresent(Int.self, forKey: .surfaceBudget) ?? d.surfaceBudget
-        self.adaptiveThrottle = try c.decodeIfPresent(Bool.self, forKey: .adaptiveThrottle) ?? d.adaptiveThrottle
-        self.antiFabricationPostCheck =
-            try c.decodeIfPresent(Bool.self, forKey: .antiFabricationPostCheck) ?? d.antiFabricationPostCheck
-        self.conversationStateEnabled =
-            try c.decodeIfPresent(Bool.self, forKey: .conversationStateEnabled) ?? d.conversationStateEnabled
-        self.conversationStateIntervalSeconds =
-            try c.decodeIfPresent(Int.self, forKey: .conversationStateIntervalSeconds)
-            ?? d.conversationStateIntervalSeconds
-        self.maxConcurrentIngests =
-            try c.decodeIfPresent(Int.self, forKey: .maxConcurrentIngests) ?? d.maxConcurrentIngests
+        self.surfaceWindowMinutes =
+            try c.decodeIfPresent(Int.self, forKey: .surfaceWindowMinutes) ?? d.surfaceWindowMinutes
+        self.checkCadenceSeconds =
+            try c.decodeIfPresent(Int.self, forKey: .checkCadenceSeconds) ?? d.checkCadenceSeconds
         self.manualTrigger = try c.decodeIfPresent(ManualTriggerConfig.self, forKey: .manualTrigger) ?? d.manualTrigger
-    }
-
-    public struct ModeToggles: Sendable, Codable, Hashable {
-        public var grounded: Bool
-        public var synthesized: Bool
-        public var general: Bool
-        public var reframe: Bool
-        public var agenda: Bool
-
-        public init(
-            grounded: Bool = true, synthesized: Bool = true, general: Bool = true,
-            reframe: Bool = true, agenda: Bool = true
-        ) {
-            self.grounded = grounded
-            self.synthesized = synthesized
-            self.general = general
-            self.reframe = reframe
-            self.agenda = agenda
-        }
-
-        public static let `default` = ModeToggles()
     }
 
     public struct ManualTriggerConfig: Sendable, Codable, Hashable {

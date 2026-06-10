@@ -269,7 +269,8 @@ public struct SettingsDetailPane: View {
         case .dictationModels: return "Choose the model that turns your speech into text, and pick its language."
         case .meetings: return "Set how meetings are detected, transcribed, and written up."
         case .llmRouter: return "Connect the AI services Trace can use, and choose which one handles each task."
-        case .coachTriggers: return "Choose what live tips the coach shows you in a meeting, and when."
+        case .coachTriggers:
+            return "Live help during meetings — answers, recalled notes, and things to say. Runs on a cloud model."
         case .integrations: return "Connect your calendar, watch folders for recordings, and let Trace type for you."
         case .diagnostics: return "Check your current setup and export a report if something goes wrong."
         case .about: return "Version, credits, and a way to run setup again."

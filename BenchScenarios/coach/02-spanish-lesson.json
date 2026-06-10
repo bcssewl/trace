@@ -1,0 +1,17 @@
+{
+  "name": "spanish-lesson",
+  "description": "An entirely Spanish conversation lesson. The teacher asks the user a question in Spanish (what they did last weekend, using the preterite). A good companion offers help in Spanish — the card body must contain expected Spanish content words, never an English-only reply.",
+  "utterances": [
+    { "t": 0, "speaker": "Lucía", "text": "¡Hola! ¿Cómo estás hoy? ¿Listo para practicar un poco?" },
+    { "t": 12, "speaker": "You", "text": "Hola Lucía, estoy bien, gracias. Un poco cansado pero listo." },
+    { "t": 25, "speaker": "Lucía", "text": "Me alegro. Hoy vamos a practicar el pretérito indefinido, ¿vale?" },
+    { "t": 38, "speaker": "You", "text": "Vale, perfecto. El pretérito siempre me cuesta un poco." },
+    { "t": 52, "speaker": "Lucía", "text": "No te preocupes, es normal. Vamos a empezar con algo sencillo." },
+    { "t": 66, "speaker": "Lucía", "text": "Cuéntame: ¿qué hiciste el fin de semana pasado? Intenta usar tres verbos en pretérito." },
+    { "t": 82, "speaker": "You", "text": "A ver... el sábado... eh..." },
+    { "t": 98, "speaker": "Lucía", "text": "Tranquilo, tómate tu tiempo." }
+  ],
+  "expect": [
+    { "type": "card_in_language", "language": "es", "keywords": ["fui", "visité", "comí", "fin de semana", "pasado", "pretérito", "hice", "jugué", "estuve"] }
+  ]
+}

@@ -349,8 +349,8 @@ public struct LLMRouterSettingsView: View {
                     }
                 }
             }
-            SettingsGroup("Model for each task", tag: "\(LLMRouteStage.allCases.count) tasks") {
-                let stages = LLMRouteStage.allCases
+            SettingsGroup("Model for each task", tag: "\(LLMRouteStage.userConfigurable.count) tasks") {
+                let stages = LLMRouteStage.userConfigurable
                 ForEach(Array(stages.enumerated()), id: \.element) { idx, stage in
                     perTaskRoutingRows(state: state, stage: stage, isLast: idx == stages.count - 1)
                 }
@@ -703,115 +703,57 @@ private struct CoachTriggersBody: View {
     @State private var ollamaModels: [String] = []
     @State private var showAdvanced = false
 
+    /// Honest label for the rolling card allowance: names the actual window
+    /// (default quarter-hour), and stays truthful if the window is changed
+    /// under Advanced.
+    private var cardsAllowanceKey: String {
+        switch state.coachConfig.effectiveSurfaceWindowMinutes {
+        case 15: return "Most cards per quarter-hour"
+        case 1: return "Most cards per minute"
+        case let minutes: return "Most cards per \(minutes) minutes"
+        }
+    }
+
+    /// The window named in plain words for the hint text.
+    private var cardsWindowPhrase: String {
+        switch state.coachConfig.effectiveSurfaceWindowMinutes {
+        case 15: return "quarter-hour"
+        case 1: return "one-minute"
+        case let minutes: return "\(minutes)-minute"
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             SettingsGroup("Meeting coach") {
                 SettingsRow(
                     key: "Turn on the coach",
                     hint:
-                        "Show helpful tips on screen while you’re in a meeting. The coach listens along and surfaces a card when it has something useful to add."
+                        "Show helpful cards on screen while you’re in a meeting — answers to what’s being asked, things recalled from your notes, suggestions for what to say. While it’s on, the live meeting transcript is sent to the cloud model you choose below."
                 ) {
                     Toggle("", isOn: $state.coachEnabled).labelsHidden()
                 }
             }
             coachModelGroup
-            SettingsGroup("What the coach can show", tag: "5 kinds") {
-                modeRow(
-                    title: "Straight from your playbooks",
-                    hint: "Pulls the exact wording from your own saved notes and playbooks. The most trustworthy kind.",
-                    meta: "When it’s a strong match", binding: $state.coachConfig.modes.grounded)
-                modeRow(
-                    title: "Pulled together for you",
-                    hint: "Combines a few partial matches from your notes into one tip.",
-                    meta: "When a few notes loosely fit", binding: $state.coachConfig.modes.synthesized)
-                modeRow(
-                    title: "General knowledge",
-                    hint:
-                        "Answers from the model’s own knowledge when nothing in your notes fits. Always marked as such.",
-                    meta: "For definitions and industry basics", binding: $state.coachConfig.modes.general)
-                modeRow(
-                    title: "Suggest a better question",
-                    hint:
-                        "When a question needs details only you have, the coach helps you reframe it rather than guessing.",
-                    meta: "When answering directly isn’t safe", binding: $state.coachConfig.modes.reframe)
-                modeRow(
-                    title: "Agenda tracker",
-                    hint: "Reads the agenda from your calendar event and checks off topics as you cover them.",
-                    meta: "When the event has an agenda", binding: $state.coachConfig.modes.agenda)
-            }
             SettingsGroup("How often it speaks up") {
                 SettingsRow(
-                    key: "Most cards per meeting",
+                    key: cardsAllowanceKey,
                     hint:
-                        "The most tips the coach will show on its own. Asking for one yourself (triple-tap) never counts toward this."
+                        "The most cards the coach will show on its own in any \(cardsWindowPhrase) stretch. The allowance tops back up as the meeting moves on, so help is spread across a long meeting rather than spent in the opening minutes. Asking for one yourself (triple-tap or the Ask buttons) never counts toward this.",
+                    showDivider: false
                 ) {
                     HStack {
                         Slider(
                             value: Binding(
                                 get: { Double(state.coachConfig.surfaceBudget) },
                                 set: { state.coachConfig.surfaceBudget = Int($0) }
-                            ), in: 1...20
+                            ), in: 1...10
                         )
                         .frame(width: 180)
                         Text("\(state.coachConfig.surfaceBudget)")
                             .font(BrutalistTypography.mono11)
                             .foregroundStyle(palette.primary.color)
                             .frame(width: 30)
-                    }
-                }
-                SettingsRow(
-                    key: "Match the pace of the conversation",
-                    hint:
-                        "Show tips closer together when the discussion is lively, and space them out when it’s quiet.",
-                    value: "Lively: right away · Quiet: every 12s"
-                ) {
-                    Toggle("", isOn: $state.coachConfig.adaptiveThrottle).labelsHidden()
-                }
-                SettingsRow(
-                    key: "Double-check AI tips for made-up details",
-                    hint:
-                        "Before showing a tip the AI wrote, quietly check it isn’t inventing specifics. Tips taken straight from your notes skip this.",
-                    value: "Off by default · adds a quick check per AI tip"
-                ) {
-                    Toggle("", isOn: $state.coachConfig.antiFabricationPostCheck).labelsHidden()
-                }
-            }
-            SettingsGroup(
-                "Follow the whole conversation", tag: "Every \(state.coachConfig.conversationStateIntervalSeconds)s"
-            ) {
-                SettingsRow(
-                    key: "Keep track of the discussion",
-                    hint:
-                        "The coach keeps a quiet running summary of the meeting — the topic, open questions, sticking points, and decisions — so its tips fit the whole conversation, not just the last sentence. Choose which model handles this under AI models.",
-                    value: "Turn on here · choose the model under AI models"
-                ) {
-                    HStack(spacing: 10) {
-                        ExplainEye(
-                            title: "Following the conversation",
-                            message:
-                                "While you’re in a meeting, the coach quietly keeps a short running summary of what’s being discussed — the current topic, open questions, points of tension, and any decisions made. It refreshes in the background on the schedule below. The coach reads this summary so its on-screen tips fit the whole conversation instead of just reacting to the last thing said. It’s never shown on screen — it only makes the suggestions sharper. Turn it off if you’d rather the coach react in the moment, or to do a little less work behind the scenes."
-                        )
-                        Toggle("", isOn: $state.coachConfig.conversationStateEnabled).labelsHidden()
-                    }
-                }
-                SettingsRow(
-                    key: "Refresh the summary",
-                    hint:
-                        "How often the running summary updates. More often means fresher context but a bit more work behind the scenes — worth easing off if you’ve pointed this at a paid cloud model.",
-                    showDivider: false
-                ) {
-                    HStack {
-                        Slider(
-                            value: Binding(
-                                get: { Double(state.coachConfig.conversationStateIntervalSeconds) },
-                                set: { state.coachConfig.conversationStateIntervalSeconds = Int($0) }
-                            ), in: 15...180, step: 5
-                        )
-                        .frame(width: 180)
-                        Text("\(state.coachConfig.conversationStateIntervalSeconds)s")
-                            .font(BrutalistTypography.mono11)
-                            .foregroundStyle(palette.primary.color)
-                            .frame(width: 44)
                     }
                 }
             }
@@ -917,79 +859,101 @@ private struct CoachTriggersBody: View {
         .buttonStyle(.plain)
 
         if showAdvanced {
-            SettingsGroup("Load") {
+            SettingsGroup("Checking pace") {
                 SettingsRow(
-                    key: "Cues analysed at once",
+                    key: "How often the coach checks in",
                     hint:
-                        "How many things the coach thinks about simultaneously. When the conversation outpaces this, it skips to the newest remark (and says how many it skipped). Raise it only if your model is fast and you see skips often.",
+                        "The coach reviews the conversation at most this often when something new has been said (a question jumps the queue). More often means quicker help but more cloud calls — each check is one request to your chosen model."
+                ) {
+                    HStack {
+                        Slider(
+                            value: Binding(
+                                get: { Double(state.coachConfig.checkCadenceSeconds) },
+                                set: { state.coachConfig.checkCadenceSeconds = Int($0) }
+                            ), in: 10...60, step: 5
+                        )
+                        .frame(width: 180)
+                        Text("\(state.coachConfig.checkCadenceSeconds)s")
+                            .font(BrutalistTypography.mono11)
+                            .foregroundStyle(palette.primary.color)
+                            .frame(width: 44)
+                    }
+                }
+                SettingsRow(
+                    key: "Card allowance window",
+                    hint:
+                        "How long each stretch lasts for the card allowance above. The coach shows at most that many cards on its own within any window of this length — a shorter window means the allowance tops up sooner.",
                     showDivider: false
                 ) {
-                    HStack(spacing: 8) {
-                        ForEach([1, 2, 3, 4], id: \.self) { n in
-                            Text("\(n)")
-                                .font(BrutalistTypography.mono11)
-                                .foregroundStyle(
-                                    state.coachConfig.maxConcurrentIngests == n
-                                        ? palette.primary.color : palette.fg.color
-                                )
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .overlay(
-                                    Rectangle().stroke(
-                                        state.coachConfig.maxConcurrentIngests == n
-                                            ? palette.primary.color : palette.border.color,
-                                        lineWidth: BrutalistMetrics.hairline
-                                    )
-                                )
-                                .onTapGesture { state.coachConfig.maxConcurrentIngests = n }
-                        }
+                    HStack {
+                        Slider(
+                            value: Binding(
+                                get: { Double(state.coachConfig.surfaceWindowMinutes) },
+                                set: { state.coachConfig.surfaceWindowMinutes = Int($0) }
+                            ), in: 5...30, step: 5
+                        )
+                        .frame(width: 180)
+                        Text("\(state.coachConfig.surfaceWindowMinutes) min")
+                            .font(BrutalistTypography.mono11)
+                            .foregroundStyle(palette.primary.color)
+                            .frame(width: 44)
                     }
                 }
             }
         }
     }
 
-    /// "Coach AI model" — the single, obvious place to choose which LLM powers the
-    /// live coach.
+    /// "Coach AI model" — the single place to choose which cloud LLM powers the
+    /// coach (`.coachCardContent`, the listener's only stage).
     ///
-    /// One choice fans out to all three coach stages: the card content
-    /// the user reads as "the coach", the smart-routing classifier, and the
-    /// running conversation-state summary that grounds it (`coachAIProvider` /
-    /// `coachAIStages`). Per-stage overrides still live in Settings → LLM Router
-    /// → Advanced. The `BrutalistSelectRow` list idiom paints the saved selection
-    /// directly (no native-Picker Apple-FM flash) and shows brand logos.
+    /// CLOUD-ONLY:
+    /// the list offers exclusively the connected cloud providers (OpenRouter /
+    /// Anthropic / ChatGPT / MiniMax) — never Apple FM or Ollama. With nothing
+    /// connected it states the gap plainly and points at Settings → AI models;
+    /// the coach also refuses to start in that state (`CoachCloudGate`).
     @ViewBuilder
     private var coachModelGroup: some View {
         let support = ProviderPickerSupport(availability: availability, connectedProviders: connectedProviders)
+        // `offeredProviders` is empty for the coach stage, so this is exactly
+        // the connected cloud set — a cloud provider without a key is never
+        // offered, and local providers never appear at all.
+        let cloudChoices = LLMRouteStage.coachCardContent.everydayProviders(connected: connectedProviders)
         SettingsGroup("Which AI powers the coach", tag: support.groupTag(for: state.coachAIProvider)) {
-            ForEach(support.offered(for: .coachCardContent, current: state.coachAIProvider)) { provider in
-                BrutalistSelectRow(
-                    title: provider.displayName,
-                    detail: support.detail(for: provider),
-                    selected: state.coachAIProvider == provider,
-                    showDivider: true,
-                    logo: provider.brandLogo
+            if cloudChoices.isEmpty {
+                SettingsRow(
+                    key: "No cloud model connected",
+                    hint:
+                        "The coach needs a cloud model — it doesn’t run on local ones. Connect OpenRouter, Anthropic, ChatGPT or MiniMax under AI models, then pick it here.",
+                    showDivider: false
                 ) {
-                    state.coachAIProvider = provider
+                    BrutalistButton("Open AI models", kind: .ghost) {
+                        state.pendingSettingsTab = .llmRouter
+                        NotificationCenter.default.post(name: .traceOpenSettingsTab, object: nil)
+                    }
                 }
+            } else {
+                ForEach(cloudChoices) { provider in
+                    BrutalistSelectRow(
+                        title: provider.displayName,
+                        detail: support.detail(for: provider),
+                        selected: state.coachAIProvider == provider,
+                        showDivider: true,
+                        logo: provider.brandLogo
+                    ) {
+                        state.coachAIProvider = provider
+                    }
+                }
+                StageModelRow(
+                    state: state,
+                    stage: .coachCardContent,
+                    installedOllamaModels: ollamaModels,
+                    label: "Model",
+                    openRouterPlaceholder: "google/gemini-3.1-flash-lite",
+                    openRouterHint:
+                        "The OpenRouter model name — for example google/gemini-3.1-flash-lite, anthropic/claude-sonnet-4.6, or openai/gpt-4o-mini.",
+                    showDivider: false
+                )
             }
-            StageModelRow(
-                state: state,
-                stage: .coachCardContent,
-                installedOllamaModels: ollamaModels,
-                label: "Model",
-                openRouterPlaceholder: "anthropic/claude-sonnet-4.6",
-                openRouterHint:
-                    "The OpenRouter model name — for example anthropic/claude-sonnet-4.6, openai/gpt-4o-mini, or google/gemini-2.0-flash.",
-                showDivider: false,
-                mirrorStages: [.coachSmartRouting, .conversationState]
-            )
-        }
-    }
-
-    private func modeRow(title: String, hint: String, meta: String, binding: Binding<Bool>) -> some View {
-        SettingsRow(key: title, hint: hint, value: meta) {
-            Toggle("", isOn: binding).labelsHidden()
         }
     }
 }

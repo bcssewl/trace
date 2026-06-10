@@ -1,0 +1,22 @@
+{
+  "name": "factual-question-no-kb",
+  "description": "A product team plans an EU rollout. Mid-discussion someone asks a concrete factual question (when GDPR came into force) that nobody in the room answers. A good companion answers it from general knowledge; the key fact is 2018 (applied from 25 May 2018).",
+  "utterances": [
+    { "t": 0, "speaker": "Priya", "text": "Morning both — let's sort the rollout plan for the Frankfurt region while we have the room." },
+    { "t": 14, "speaker": "You", "text": "I want us to be careful on the compliance side before we commit to any dates." },
+    { "t": 27, "speaker": "Tom", "text": "The infrastructure is the easy bit. We can mirror the Dublin setup almost one for one." },
+    { "t": 42, "speaker": "Priya", "text": "Legal asked whether our consent flows predate the current rules, because that changes what we have to re-collect." },
+    { "t": 55, "speaker": "You", "text": "That depends on the cutoff. When did GDPR actually come into force — was it 2016 or 2018?" },
+    { "t": 70, "speaker": "Tom", "text": "I always mix that up with the ePrivacy stuff, honestly." },
+    { "t": 85, "speaker": "Priya", "text": "Either way we should pull the consent records by cohort and check the dates against it." },
+    { "t": 100, "speaker": "You", "text": "Agreed. I'll ask legal for the exact cutoff in writing so we're not guessing." },
+    { "t": 118, "speaker": "Tom", "text": "On capacity — Frankfurt gives us three availability zones, which is plenty for launch." },
+    { "t": 135, "speaker": "Priya", "text": "Marketing wants a date for the announcement. They're pushing for the first week of September." },
+    { "t": 150, "speaker": "You", "text": "Only if the data-residency sign-off lands by mid-August. I'll chase it this week." },
+    { "t": 168, "speaker": "Tom", "text": "I'll draft the runbook for the migration window in the meantime." },
+    { "t": 185, "speaker": "Priya", "text": "Good. Same time Thursday, then." }
+  ],
+  "expect": [
+    { "type": "answer_containing", "keywords": ["2018"] }
+  ]
+}

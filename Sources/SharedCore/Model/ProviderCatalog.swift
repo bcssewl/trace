@@ -102,7 +102,7 @@ public enum ModelProvider: String, Sendable, Hashable, CaseIterable, Identifiabl
         switch self {
         case .appleFM: return ["apple-fm-default"]
         case .ollama: return ["llama3.2"]
-        case .openRouter: return ["google/gemini-3.1-flash-lite"]
+        case .openRouter: return ["google/gemini-3.1-flash-lite", "google/gemini-3.5-flash"]
         case .anthropic: return ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"]
         case .minimax: return ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2"]
         case .chatgpt: return ["gpt-5.1", "gpt-5.1-codex"]

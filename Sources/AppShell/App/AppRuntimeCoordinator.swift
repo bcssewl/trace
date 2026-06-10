@@ -106,7 +106,9 @@ public final class AppRuntimeCoordinator {
     /// Set by AppDelegate so the coordinator can present + drive the
     /// screen-share-invisible coach overlay during meetings.
     public weak var coachOverlay: CoachOverlayController?
-    private var coachOrchestrator: CoachOrchestrator?
+    /// The meeting coach: one persistent listener (cached across meetings, reset
+    /// per meeting via `beginMeeting`). Replaces the old gatekeeper pipeline.
+    private var coachListener: CoachListener?
     private var coachVectorSearch: VectorSearch?
     /// Library search / cross-meeting Q&A stack (BAS-19), built lazily over the
     /// shared database + router once bootstrap completes.
@@ -116,19 +118,9 @@ public final class AppRuntimeCoordinator {
     private var meetingChunkIndexer: MeetingChunkIndexer?
     private var libraryEntryIndexer: LibraryEntryIndexer?
     private var coachSubscriptionTask: Task<Void, Never>?
-    /// App-lifetime subscription to the coach pipeline's health events (the
-    /// orchestrator is cached across meetings, so this is created once with it).
+    /// App-lifetime subscription to the coach listener's health events (the
+    /// listener is cached across meetings, so this is created once with it).
     private var coachHealthTask: Task<Void, Never>?
-    /// Rolling window of recent utterance text — feeds topic-shift detection and
-    /// the manual-trigger "help me now" context.
-    private var coachRecentText: [String] = []
-    /// Routed conversation-state extractor + its ~30s ticker, feeding the coach
-    /// orchestrator live context (topic / open questions / tensions / decisions)
-    /// during a meeting (BAS-16).
-    ///
-    /// Built lazily alongside the orchestrator.
-    private var coachConversationStateExtractor: ConversationStateExtractor?
-    private var coachConversationStateTask: Task<Void, Never>?
 
     public init(environment: AppEnvironment) {
         self.environment = environment
@@ -298,9 +290,14 @@ public final class AppRuntimeCoordinator {
         }
         observeName(.traceCoachConfigChanged) { [weak self] _ in
             self?.applyCoachConfigChange()
-            // Coach routing + card-content routes ride this notification too (BAS-35).
+            // The coach model route rides this notification too (BAS-35).
             Task { [weak self] in await self?.applyRoutes(matching: .traceCoachConfigChanged) }
         }
+        // Dismissing the overlay for the meeting pauses the listener's automatic
+        // checks — each is a paid cloud call producing cards nobody would see.
+        // Reopening (menu bar / manual trigger) resumes them.
+        observeName(.traceCoachOverlayDismiss) { [weak self] _ in self?.setCoachAutoChecksPaused(true) }
+        observeName(.traceCoachOverlayReopen) { [weak self] _ in self?.setCoachAutoChecksPaused(false) }
         observeName(.traceRequestTranscribeFile) { [weak self] _ in self?.runTranscribeFile() }
         observeName(.traceDictationPrefsChanged) { [weak self] _ in self?.resetDictationRuntime() }
         observeName(.traceWatchedFoldersChanged) { [weak self] _ in self?.restartWatchedFolders() }
@@ -2085,49 +2082,91 @@ public final class AppRuntimeCoordinator {
 
     // MARK: Coach (in-meeting assistant overlay)
 
-    /// Lazily build the Coach pipeline, reusing the app's ModelRouter + database.
+    /// Lazily build the coach listener, reusing the app's ModelRouter + database.
     ///
-    /// RAG embeddings route to Ollama (`nomic-embed-text`); utterance
-    /// classification + card content route to Apple FM. Returns nil until
+    /// Retrieval embeds via the user's embedding route (`.embeddingsLive`);
+    /// the listener's model calls route through `.coachCardContent` — cloud-only,
+    /// enforced by `startCoach`'s `CoachCloudGate` check. Returns nil until
     /// bootstrap has provided the database + router.
-    private func ensureCoachOrchestrator() -> CoachOrchestrator? {
-        if let coachOrchestrator { return coachOrchestrator }
+    private func ensureCoachListener() -> CoachListener? {
+        if let coachListener { return coachListener }
         guard let db = database, let router = self.router else { return nil }
         let embedConfig = ragEmbedConfig()
         let vectorSearch = VectorSearch(cache: KbCache(db: db), config: embedConfig)
         self.coachVectorSearch = vectorSearch
-        let detector = EmbeddingDetector(
+        let retriever = CoachRetriever(
             embedder: EmbeddingClient(router: router, config: embedConfig, task: .embeddingsLive),
             vectorSearch: vectorSearch
         )
-        let orchestrator = CoachOrchestrator(
+        let listener = CoachListener(
             config: effectiveCoachConfig(),
-            embeddingDetector: detector,
-            classifier: AppleFmUtteranceClassifier(router: router),
-            smartRouter: AppleFmSmartRouter(router: router),
-            antiFabChecker: AppleFmAntiFabricationChecker(router: router)
+            router: router,
+            retriever: retriever,
+            onEvent: { [weak self] event in
+                await MainActor.run { self?.applyCoachEvent(event) }
+            }
         )
-        self.coachConversationStateExtractor = ConversationStateExtractor(
-            model: RoutedConversationStateModel(router: router)
-        )
-        self.coachOrchestrator = orchestrator
-        // Surface pipeline health on the overlay (banner + pill warning) — the
-        // orchestrator emits edge-triggered events (one per outage, one per
-        // recovery), so no rate limiting is needed here.
+        self.coachListener = listener
+        // Surface listener health on the overlay (banner + pill warning) — the
+        // listener emits edge-triggered events (one per outage, one per
+        // recovery), so no rate limiting is needed here. The coalesced notice is
+        // the backstop for when the overlay itself is dismissed.
         coachHealthTask?.cancel()
         coachHealthTask = Task { [weak self] in
-            let stream = await orchestrator.healthEvents()
+            let stream = await listener.healthEvents()
             for await event in stream {
                 guard let self else { break }
                 self.coachOverlay?.applyHealthEvent(event)
-                if case .stageUnavailable(let stage, let reason) = event {
+                switch event {
+                case .stageUnavailable(let stage, let reason):
                     Loggers.bridges.error(
                         "Coach stage unavailable: \(String(describing: stage), privacy: .public) — \(reason, privacy: .public)"
                     )
+                    if stage == .listener {
+                        self.environment.notices.post(
+                            severity: .warning,
+                            title: "Coach paused",
+                            message:
+                                "The coach could not check the conversation — its model may be unavailable. It will resume automatically if the model recovers.",
+                            actions: [.openSettingsTab(.llmRouter, label: "Open Settings → AI models")],
+                            coalescingKey: "coach.check"
+                        )
+                    }
+                case .stageRecovered(let stage):
+                    if stage == .listener {
+                        self.environment.notices.clear(coalescingKey: "coach.check")
+                    }
                 }
             }
         }
-        return orchestrator
+        return listener
+    }
+
+    /// Whether `.coachCardContent` is routed to a connected cloud provider —
+    /// the coach's cloud-only gate. The refusal path is loud (a notice pointing
+    /// at Settings → AI models), never a silent no-op.
+    private func coachCloudRouteReady() -> Bool {
+        CoachCloudGate.isSatisfied(
+            provider: environment.state.provider(for: .coachCardContent),
+            connected: ModelProvider.routingConnectedSet()
+        )
+    }
+
+    /// Post the loud "coach needs a cloud model" notice (coalesced).
+    private func postCoachCloudGateNotice() {
+        environment.notices.post(
+            severity: .warning,
+            title: "Coach needs a cloud model",
+            message: "The coach needs a cloud model. Connect one in Settings → AI models.",
+            actions: [.openSettingsTab(.llmRouter, label: "Open Settings → AI models")],
+            coalescingKey: "coach.cloudRoute"
+        )
+    }
+
+    /// Pause/resume the listener's automatic checks (overlay dismissed/reopened).
+    private func setCoachAutoChecksPaused(_ paused: Bool) {
+        guard let listener = coachListener else { return }
+        Task { await listener.setAutoChecksPaused(paused) }
     }
 
     /// The live Coach config: the user's persisted behavior config with `enabled`
@@ -2185,9 +2224,9 @@ public final class AppRuntimeCoordinator {
     }
 
     /// Coach settings changed: rebuild the triple-tap monitor from the new manual-
-    /// trigger config, push the new behavior config into a running orchestrator so
-    /// mode / budget / throttle / anti-fabrication edits take effect mid-meeting,
-    /// and — if the master switch was turned off — tear down a live overlay.
+    /// trigger config, push the new behaviour config into a running listener so
+    /// budget / cadence edits take effect mid-meeting, and — if the master
+    /// switch was turned off — tear down a live overlay.
     ///
     /// (Turning it back on mid-meeting takes effect on the next meeting.)
     private func applyCoachConfigChange() {
@@ -2196,183 +2235,114 @@ public final class AppRuntimeCoordinator {
         // Coach-settings edit mid-meeting doesn't overwrite a project's
         // per-project Coach config. effectiveCoachConfig(projectID:) is async, so
         // resolve it inside the Task.
-        if coachOrchestrator != nil {
+        if coachListener != nil {
             let projectID = activeMeetingProjectID
             Task { [weak self] in
-                guard let self, let orchestrator = self.coachOrchestrator else { return }
-                await orchestrator.updateConfig(self.effectiveCoachConfig(projectID: projectID))
+                guard let self, let listener = self.coachListener else { return }
+                await listener.updateConfig(self.effectiveCoachConfig(projectID: projectID))
             }
         }
         if !environment.state.coachEnabled {
             coachSubscriptionTask?.cancel()
             coachSubscriptionTask = nil
-            coachConversationStateTask?.cancel()
-            coachConversationStateTask = nil
+            if let listener = coachListener { Task { await listener.endMeeting() } }
             coachOverlay?.update(activeCard: nil)
-            coachOverlay?.update(conversationState: "")
             coachOverlay?.hide()
         }
     }
 
-    /// Present the coach overlay and subscribe it to the meeting's live utterance
-    /// stream.
+    /// Present the coach overlay and subscribe the listener to the meeting's
+    /// live utterance stream.
     ///
-    /// Each committed utterance runs the Coach pipeline; surfaced cards
-    /// (and suppressed-but-detected moments) update the overlay.
+    /// The listener accumulates the whole meeting and
+    /// runs its own cadence of checks between `beginMeeting`/`endMeeting`;
+    /// surfaced (and withheld) cards arrive back via `applyCoachEvent`.
+    ///
+    /// CLOUD-ONLY: refuses to start without a connected cloud route for
+    /// `.coachCardContent` — loudly, via the cloud-gate notice.
     private func startCoach(runtime: MeetingRuntime, projectName: String, config: CoachConfig) {
         // `config` is the project-aware effective config: a project may turn
         // Coach off (config.enabled false) even when globally on.
-        guard config.enabled, let orchestrator = ensureCoachOrchestrator() else { return }
-        coachRecentText.removeAll()
+        guard config.enabled else { return }
+        guard coachCloudRouteReady() else {
+            Loggers.bridges.warning("Coach not started — no connected cloud model for .coachCardContent")
+            postCoachCloudGateNotice()
+            return
+        }
+        guard let listener = ensureCoachListener() else {
+            // Near-unreachable (database/router gone while a meeting captures),
+            // but the coach failing to appear must never be a silent shrug.
+            Loggers.bridges.error("Coach not started — listener could not be constructed")
+            environment.notices.post(
+                severity: .warning,
+                title: "Coach could not start",
+                message: "The coach's components could not be prepared. Restart Trace if this persists.",
+                coalescingKey: "coach.listener"
+            )
+            return
+        }
         coachOverlay?.applyAppearance(environment.state.appearancePreference)
-        // Fresh meeting → clean health banner, skip counter and dismissal state.
+        // Fresh meeting → clean health banner and dismissal state. Also clear a
+        // leftover "Coach paused" notice from a PREVIOUS meeting's outage:
+        // beginMeeting resets the failure baseline without emitting a recovery,
+        // so a fixed model would otherwise leave that stale warning up for ever.
+        environment.notices.clear(coalescingKey: "coach.check")
         coachOverlay?.prepareForNewMeeting()
         // Start in the compact listening pill — don't auto-pop a full card at
         // meeting start. A real card flips it open (CoachOverlayController.update).
         coachOverlay?.minimizeToPill()
         coachOverlay?.present(projectName: projectName)
-        coachOverlay?.update(conversationState: "")
         coachSubscriptionTask?.cancel()
-        // Capture the active meeting's project so the coach scopes grounded
-        // retrieval to it (plus global playbooks) instead of every past meeting.
+        // Capture the active meeting's project so the listener scopes retrieval
+        // to it (plus global playbooks) instead of every past meeting.
         let projectID = activeMeetingProjectID
         coachSubscriptionTask = Task { [weak self] in
-            // Adopt this project's coach behavior config, then reset per-meeting
-            // surface budget + throttle and load any indexed playbook embeddings.
-            await orchestrator.updateConfig(config)
-            await orchestrator.beginMeeting(projectID: projectID)
+            // Adopt this project's coach behaviour config, then reset per-meeting
+            // state (transcript, budget, shown cards) and start the cadence loop.
+            await listener.updateConfig(config)
+            await listener.beginMeeting(projectID: projectID)
             // Loud refresh: a down embedding model at meeting start would
-            // otherwise silently ground the coach on a stale index (the
-            // per-utterance path can't catch it — its evaluate still succeeds).
+            // otherwise silently ground the coach on a stale index.
             await self?.refreshVectorIndicesLoudly(context: "coach start")
             for await utt in runtime.utteranceStream() {
                 guard let self else { break }
-                self.appendCoachWindow(utt.text)
-                let cu = CoachUtterance(
-                    speakerId: utt.speaker.rawValue,
-                    text: utt.text,
-                    timestamp: Date(),
-                    userRequested: false
-                )
-                // Detach per utterance so a slow LLM can't make the stream back
-                // up behind one cue. `enqueue` bounds concurrency (max 2 in
-                // flight; the newest waiting utterance supersedes older ones —
-                // a superseded call returns nil and is surfaced via the
-                // `.cueSkipped` health event, never silently).
-                let windowText = self.coachWindowText()
-                Task { [weak self] in
-                    do {
-                        if let result = try await orchestrator.enqueue(
-                            utterance: cu, windowText: windowText
-                        ) {
-                            self?.applyCoachResult(result)
-                        }
-                    } catch {
-                        // The orchestrator already emitted a stageUnavailable
-                        // health event before rethrowing — the overlay banner is
-                        // driving the user-visible side. The notice is a backstop
-                        // for when the overlay itself is dismissed; coalesced, so
-                        // a model that's down all meeting yields one banner.
-                        Loggers.bridges.warning(
-                            "Coach ingest failed: \(error.localizedDescription, privacy: .public)")
-                        self?.environment.notices.post(
-                            severity: .warning,
-                            title: "Coach paused",
-                            message:
-                                "The coach could not analyse the conversation — its model may be unavailable. It will resume automatically if the model recovers.",
-                            actions: [
-                                .openSettingsTab(.coachTriggers, label: "Open Settings → Meeting coach")
-                            ],
-                            coalescingKey: "coach.ingest"
-                        )
-                    }
-                }
-            }
-        }
-        startCoachConversationState(orchestrator: orchestrator)
-    }
-
-    /// Periodically (~30s) roll the conversation-state summary forward via the
-    /// routed extractor (prior state + latest transcript window) and feed its
-    /// digest to the orchestrator, so the smart router runs with live context
-    /// (topic / open questions / tensions / decisions) instead of blind.
-    ///
-    /// The
-    /// extractor accumulates across ticks, so context persists for the whole
-    /// meeting without ever sending the full transcript. Reset once per meeting,
-    /// then gated per-tick by `conversationStateEnabled` so the stage can be
-    /// toggled mid-meeting.
-    private func startCoachConversationState(orchestrator: CoachOrchestrator) {
-        coachConversationStateTask?.cancel()
-        guard let extractor = coachConversationStateExtractor else { return }
-        coachConversationStateTask = Task { [weak self] in
-            await extractor.reset()
-            while !Task.isCancelled {
-                // Read the cadence each loop so a mid-meeting change applies to the
-                // next tick. Floor at 5s as a safety rail against a bad value.
-                guard let intervalSeconds = self?.environment.state.coachConfig.conversationStateIntervalSeconds else {
-                    break
-                }
-                try? await Task.sleep(nanoseconds: UInt64(max(5, intervalSeconds)) * 1_000_000_000)
-                guard !Task.isCancelled, let self else { break }
-                guard self.environment.state.coachConfig.conversationStateEnabled else {
-                    // Stage toggled off mid-meeting → clear the overlay's state row.
-                    self.coachOverlay?.update(conversationState: "")
-                    continue
-                }
-                let transcript = self.coachRecentText.joined(separator: "\n")
-                guard !transcript.isEmpty else { continue }
-                do {
-                    let state = try await extractor.update(withRecentTranscript: transcript)
-                    await orchestrator.updateConversationState(state.digest)
-                    // Surface the coach's live read on the overlay (BAS-48).
-                    self.coachOverlay?.update(conversationState: state.overlayLine)
-                } catch {
-                    Loggers.bridges.debug(
-                        "Coach conversation-state update failed: \(error.localizedDescription, privacy: .public)")
-                }
+                // Real display names, with the app's user clearly marked "You" —
+                // the prompt tells the model whose side it is on by that marker.
+                let speaker = self.environment.state.meetingLive.displayName(for: utt.speaker.rawValue)
+                await listener.note(speaker: speaker, text: utt.text)
             }
         }
     }
 
-    /// Tear down the coach subscription and hide the overlay when a meeting ends.
+    /// Tear down the coach subscription, stop the listener's cadence loop, and
+    /// hide the overlay when a meeting ends.
     private func stopCoach() {
         coachSubscriptionTask?.cancel()
         coachSubscriptionTask = nil
-        coachConversationStateTask?.cancel()
-        coachConversationStateTask = nil
-        coachRecentText.removeAll()
+        if let listener = coachListener { Task { await listener.endMeeting() } }
         activeMeetingProjectID = nil
         coachOverlay?.update(activeCard: nil)
-        coachOverlay?.update(conversationState: "")
         coachOverlay?.hide()
     }
 
-    /// Route a pipeline result to the overlay: surface the card and record the
-    /// moment in the recent-trigger history (surfaced, or detected-but-suppressed).
-    private func applyCoachResult(_ result: CoachOrchestrator.PipelineResult) {
+    /// Route a listener event to the overlay: surface the card, or log a
+    /// withheld card (budget/spacing) in the recent-cues list — visible, never
+    /// a silent swallow.
+    private func applyCoachEvent(_ event: CoachListenerEvent) {
         guard let overlay = coachOverlay else { return }
-        if let card = result.card {
+        switch event {
+        case .surfaced(let card):
             overlay.update(activeCard: card)
             overlay.appendRecentTrigger(
-                RecentTrigger(label: card.title, mode: card.mode, wasSurfaced: true)
+                RecentTrigger(label: card.title, kind: card.kind, wasSurfaced: true)
             )
-        } else if result.classification != .none, let routing = result.routingOutput, routing.mode != .silent {
+        case .withheld(let card, let reason):
+            Loggers.bridges.info(
+                "Coach card \(reason.logDescription, privacy: .public) (\(reason.rawValue, privacy: .public)): \(card.title, privacy: .public)")
             overlay.appendRecentTrigger(
-                RecentTrigger(label: routing.title, mode: routing.mode, wasSurfaced: false)
+                RecentTrigger(label: card.title, kind: card.kind, wasSurfaced: false)
             )
         }
-    }
-
-    private func appendCoachWindow(_ text: String) {
-        coachRecentText.append(text)
-        if coachRecentText.count > 12 {
-            coachRecentText.removeFirst(coachRecentText.count - 12)
-        }
-    }
-
-    private func coachWindowText() -> String {
-        coachRecentText.suffix(6).joined(separator: " ")
     }
 
     private func engineLabel(for job: FileBatchJob) async -> String {
@@ -3195,24 +3165,37 @@ public final class AppRuntimeCoordinator {
             )
             return
         }
+        // Cloud-only gate: the user explicitly asked, so the refusal must be
+        // loud and actionable — never a pill that produces nothing.
+        guard coachCloudRouteReady() else {
+            Loggers.bridges.info("Manual coach trigger refused — no connected cloud model")
+            postCoachCloudGateNotice()
+            return
+        }
+        guard let listener = ensureCoachListener() else {
+            // The user explicitly asked — getting nothing must never be silent.
+            Loggers.bridges.error("Manual coach trigger refused — listener could not be constructed")
+            environment.notices.post(
+                severity: .warning,
+                title: "Coach could not answer",
+                message: "The coach's components could not be prepared. Restart Trace if this persists.",
+                coalescingKey: "coach.listener"
+            )
+            return
+        }
         environment.state.coachOverlayVisible = true
         coachOverlay?.applyAppearance(environment.state.appearancePreference)
+        // Presenting clears a dismissed-for-meeting state; resume the paused
+        // automatic checks to match (the user asked the coach back).
         coachOverlay?.present()
+        setCoachAutoChecksPaused(false)
         Loggers.bridges.info("Manual coach trigger invoked (intent: \(intent?.rawValue ?? "none", privacy: .public))")
-        // Force a card from the recent conversation window, bypassing detection
-        // gates (userRequested). No-op when nothing's been said yet (window empty).
-        guard let orchestrator = ensureCoachOrchestrator() else { return }
-        let window = coachWindowText()
-        guard !window.isEmpty else { return }
         Task { [weak self] in
-            let cu = CoachUtterance(
-                speakerId: "you", text: window, timestamp: Date(),
-                userRequested: true, intent: intent
-            )
             do {
-                // Manual cues bypass the concurrency cap and are never superseded.
-                let result = try await orchestrator.enqueue(utterance: cu, windowText: window)
-                if let result { self?.applyCoachResult(result) }
+                // The manual check bypasses cadence, budget and spacing, and
+                // ALWAYS yields a card (or a stated inability) — delivered via
+                // the listener's event stream like any other card.
+                _ = try await listener.manualCheck(intent: intent)
             } catch {
                 // The user explicitly asked — a silent nothing is not acceptable.
                 Loggers.bridges.warning(
@@ -3221,7 +3204,7 @@ public final class AppRuntimeCoordinator {
                     severity: .warning,
                     title: "Coach could not answer",
                     message: "The coach's model did not respond. Check its routing in Settings.",
-                    actions: [.openSettingsTab(.coachTriggers, label: "Open Settings → Meeting coach")],
+                    actions: [.openSettingsTab(.llmRouter, label: "Open Settings → AI models")],
                     coalescingKey: "coach.manual"
                 )
             }

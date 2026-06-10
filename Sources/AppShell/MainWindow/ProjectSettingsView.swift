@@ -97,11 +97,6 @@ public struct ProjectSettingsView: View {
             Text("Overrides the global Coach default for meetings filed into this project.")
                 .font(BrutalistTypography.caption)
                 .foregroundStyle(palette.fgMuted.color)
-            if coach.enabled {
-                Toggle("Grounded cue cards (from playbooks)", isOn: $coach.modes.grounded)
-                Toggle("Synthesized suggestions", isOn: $coach.modes.synthesized)
-                Toggle("General knowledge", isOn: $coach.modes.general)
-            }
         }
     }
 
@@ -137,7 +132,9 @@ public struct ProjectSettingsView: View {
             sectionTitle("Which model handles each task")
             Text("“Inherit” keeps your global choice. Pick a provider to override it for this project.")
                 .font(BrutalistTypography.caption).foregroundStyle(palette.fgMuted.color)
-            ForEach(LLMTaskClass.allCases, id: \.self) { task in
+            // `.coachSmartRouting` is retired (the listener redesign) — hidden
+            // from the override table; a stored override for it stays inert.
+            ForEach(LLMTaskClass.allCases.filter { $0 != .coachSmartRouting }, id: \.self) { task in
                 HStack(spacing: 10) {
                     Text(Self.label(task)).font(BrutalistTypography.label).frame(width: 200, alignment: .leading)
                     Picker("", selection: bindingModel(task)) {
@@ -354,8 +351,8 @@ public struct ProjectSettingsView: View {
         case .projectCategorization: return "Project sorting"
         case .meetingSummary: return "Meeting summary"
         case .meetingAugmentedMerge: return "Augmented notes merge"
-        case .coachSmartRouting: return "Coach routing"
-        case .coachCardContent: return "Coach card content"
+        case .coachSmartRouting: return "Coach routing (retired)"
+        case .coachCardContent: return "Meeting coach"
         case .libraryQA: return "Library Q&A"
         case .conversationStateExtractor: return "Conversation state"
         }

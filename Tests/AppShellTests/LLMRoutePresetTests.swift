@@ -26,26 +26,62 @@ final class LLMRoutePresetTests: XCTestCase {
         super.tearDown()
     }
 
-    // MARK: coach stages (BAS-35 — the previously-unwired task classes)
+    // MARK: coach stage (cloud-only listener redesign)
 
-    func testCoachStagesWired() {
-        XCTAssertEqual(LLMRouteStage.coachSmartRouting.taskClasses, [.coachSmartRouting])
+    /// The coach is ONE stage now (`.coachCardContent`), cloud-only:
+    /// - it defaults to OpenRouter (the catalogue default model),
+    /// - its picker offers NO local providers (only connected clouds), and
+    /// - `.coachSmartRouting` is retired: kept as a case for persistence
+    ///   compatibility, excluded from the user-configurable stage list.
+    func testCoachStageIsCloudOnly() {
         XCTAssertEqual(LLMRouteStage.coachCardContent.taskClasses, [.coachCardContent])
-        XCTAssertEqual(LLMRouteStage.coachSmartRouting.providerKey, "app.trace.coach.smartRoutingProvider")
         XCTAssertEqual(LLMRouteStage.coachCardContent.providerKey, "app.trace.coach.cardContentProvider")
-        XCTAssertEqual(LLMRouteStage.coachSmartRouting.configChangedNotification, .traceCoachConfigChanged)
         XCTAssertEqual(LLMRouteStage.coachCardContent.configChangedNotification, .traceCoachConfigChanged)
-        XCTAssertEqual(LLMRouteStage.coachSmartRouting.offeredProviders, [.appleFM, .ollama])
+        XCTAssertEqual(LLMRouteStage.coachCardContent.defaultProvider, .openRouter)
+        XCTAssertEqual(LLMRouteStage.coachCardContent.offeredProviders, [], "no always-on local providers")
+        // The everyday picker list is exactly the CONNECTED cloud set.
+        XCTAssertEqual(LLMRouteStage.coachCardContent.everydayProviders(connected: []), [])
+        XCTAssertEqual(
+            LLMRouteStage.coachCardContent.everydayProviders(connected: [.openRouter, .anthropic]),
+            [.openRouter, .anthropic]
+        )
         let state = AppStateModel()
-        XCTAssertEqual(state.provider(for: .coachSmartRouting), .appleFM, "coach routing defaults local")
-        XCTAssertEqual(state.provider(for: .coachCardContent), .appleFM, "coach card content defaults local")
+        XCTAssertEqual(state.provider(for: .coachCardContent), .openRouter, "cloud catalogue default")
+        XCTAssertEqual(
+            state.model(for: .coachCardContent, provider: .openRouter), "google/gemini-3.1-flash-lite",
+            "OpenRouter's catalogue default model")
+    }
+
+    func testCoachSmartRoutingIsRetired() {
+        XCTAssertTrue(LLMRouteStage.allCases.contains(.coachSmartRouting), "case kept for persistence")
+        XCTAssertFalse(
+            LLMRouteStage.userConfigurable.contains(.coachSmartRouting),
+            "retired: not offered anywhere user-facing")
+        XCTAssertEqual(
+            Set(LLMRouteStage.userConfigurable + [.coachSmartRouting]), Set(LLMRouteStage.allCases),
+            "userConfigurable is allCases minus exactly the retired stage")
+    }
+
+    /// A coach provider persisted by the OLD build (Apple FM / Ollama) coerces
+    /// to the cloud default on restore — the coach can't run locally, so an
+    /// upgrade must land on a runnable route instead of a guaranteed refusal.
+    func testCoachLocalProviderCoercesToCloudOnRestore() {
+        UserDefaults.standard.set(
+            DictationCleanupProvider.appleFM.rawValue, forKey: LLMRouteStage.coachCardContent.providerKey)
+        let state = AppStateModel()
+        XCTAssertEqual(state.provider(for: .coachCardContent), .openRouter)
+        // A persisted CLOUD choice is kept.
+        UserDefaults.standard.set(
+            DictationCleanupProvider.anthropic.rawValue, forKey: LLMRouteStage.coachCardContent.providerKey)
+        let state2 = AppStateModel()
+        XCTAssertEqual(state2.provider(for: .coachCardContent), .anthropic)
     }
 
     func testEveryLLMTaskClassIsRoutableFromSomeStage() {
         let covered = Set(LLMRouteStage.allCases.flatMap(\.taskClasses))
         XCTAssertEqual(
             covered, Set(LLMTaskClass.allCases),
-            "every LLM task class must be routable from a stage in the Advanced table")
+            "every LLM task class must be routable from a stage (the retired one included, for persistence)")
     }
 
     // MARK: presets
@@ -57,7 +93,7 @@ final class LLMRoutePresetTests: XCTestCase {
         // keyed, so the preset check is against the fully-connected everyday set.)
         let allConnected = Set(ModelProvider.keyedCloudProviders)
         for preset in LLMRoutePreset.allCases {
-            for stage in LLMRouteStage.allCases {
+            for stage in LLMRouteStage.userConfigurable {
                 XCTAssertTrue(
                     stage.everydayProviders(connected: allConnected).contains(preset.provider(for: stage)),
                     "\(preset.rawValue) assigns \(preset.provider(for: stage).rawValue) to \(stage.rawValue), not in its offered set"
@@ -66,18 +102,21 @@ final class LLMRoutePresetTests: XCTestCase {
         }
     }
 
-    func testLocalFirstIsAllLocal() {
-        for stage in LLMRouteStage.allCases {
+    func testLocalFirstIsAllLocalExceptTheCloudOnlyCoach() {
+        for stage in LLMRouteStage.userConfigurable where stage != .coachCardContent {
             XCTAssertNotEqual(
                 LLMRoutePreset.localFirst.provider(for: stage), .openRouter,
                 "Local-first must never route \(stage.rawValue) to the cloud")
         }
+        // The coach is cloud-only by design — even Local-first leaves it on
+        // OpenRouter (it is opt-in/off by default, so nothing calls out).
+        XCTAssertEqual(LLMRoutePreset.localFirst.provider(for: .coachCardContent), .openRouter)
     }
 
     func testLocalFirstMatchesShippedDefaults() {
-        // Local-first must equal the all-local defaults so a fresh install reads
+        // Local-first must equal the shipped defaults so a fresh install reads
         // as "Local-first", not "Custom".
-        for stage in LLMRouteStage.allCases {
+        for stage in LLMRouteStage.userConfigurable {
             XCTAssertEqual(
                 LLMRoutePreset.localFirst.provider(for: stage), stage.defaultProvider,
                 "Local-first diverges from the default for \(stage.rawValue)")
@@ -90,12 +129,14 @@ final class LLMRoutePresetTests: XCTestCase {
         XCTAssertEqual(LLMRoutePreset.cloudHeavy.provider(for: .coachCardContent), .openRouter)
     }
 
-    func testApplyPresetSetsAndPersistsEveryStage() {
+    func testApplyPresetSetsAndPersistsEveryConfigurableStage() {
         let state = AppStateModel()
         state.applyRoutePreset(.cloudHeavy)
-        for stage in LLMRouteStage.allCases {
+        for stage in LLMRouteStage.userConfigurable {
             XCTAssertEqual(state.provider(for: stage), LLMRoutePreset.cloudHeavy.provider(for: stage))
         }
+        // The retired stage is untouched by presets.
+        XCTAssertNil(UserDefaults.standard.string(forKey: LLMRouteStage.coachSmartRouting.providerKey))
         XCTAssertEqual(
             UserDefaults.standard.string(forKey: LLMRouteStage.meetingNotes.providerKey),
             DictationCleanupProvider.openRouter.rawValue,

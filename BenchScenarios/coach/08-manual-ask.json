@@ -1,0 +1,20 @@
+{
+  "name": "manual-ask",
+  "description": "A quiet planning chat the automatic checks should leave alone, then the user triggers a manual ask (intent: answer) right after an ambiguous remark about the spring option's numbers. A manual ask must ALWAYS produce a card, even when the model would rather stay silent.",
+  "utterances": [
+    { "t": 0, "speaker": "Jo", "text": "So — spring or autumn for the workshop series. That's the real decision today." },
+    { "t": 15, "speaker": "You", "text": "Walk me through where you've got to." },
+    { "t": 30, "speaker": "Jo", "text": "Venue costs are flat year-round; facilitation is the variable bit." },
+    { "t": 48, "speaker": "You", "text": "And demand-wise, autumn usually books better for us." },
+    { "t": 65, "speaker": "Jo", "text": "Usually, yes. Honestly, I'm still not sure the numbers work for the spring option at all." },
+    { "t": 85, "speaker": "Jo", "text": "Anyway — we don't have to decide this second." },
+    { "t": 100, "speaker": "You", "text": "Let's pencil in autumn and revisit once the facilitator quotes land." },
+    { "t": 115, "speaker": "Jo", "text": "Deal." }
+  ],
+  "manualAsks": [
+    { "t": 68, "intent": "answer" }
+  ],
+  "expect": [
+    { "type": "manual_always_answers" }
+  ]
+}

@@ -234,19 +234,15 @@ public final class CoachOverlayController {
         // (nil) is always allowed.
         if activeCard != nil, !state.dismissState.acceptsCards { return }
         state.activeCard = activeCard
-        // A real card surfaces the full cue card; a silent/empty result must NOT
-        // pop an empty card — stay compact (behavioral fix).
-        if let card = activeCard, card.mode != .silent, !card.isEmpty {
+        // A real card surfaces the full cue card; an empty result must NOT pop
+        // an empty card — stay compact.
+        if let card = activeCard, !card.isEmpty {
             state.mode = .card
             state.surfacedAt = Date()
         } else {
             // No useful card → collapse to listening pill (don't show empty card).
             if state.mode == .card { state.mode = .compact }
         }
-    }
-
-    public func update(conversationState: String) {
-        state.conversationState = conversationState
     }
 
     public func appendRecentTrigger(_ trigger: RecentTrigger) {
@@ -256,19 +252,18 @@ public final class CoachOverlayController {
         }
     }
 
-    /// Apply an orchestrator health event to the overlay: drives the status
-    /// banner (model unavailable / recovered) and the skipped-cues counter.
+    /// Apply a listener health event to the overlay: drives the status banner
+    /// (model unavailable / recovered).
     ///
-    /// The orchestrator's emission is already edge-triggered (one event per
+    /// The listener's emission is already edge-triggered (one event per
     /// outage), and the banner model additionally honours a user dismissal — so
-    /// a dead model shows one banner, not one per utterance.
+    /// a dead model shows one banner, not one per check.
     public func applyHealthEvent(_ event: CoachHealthEvent) {
         state.health.apply(event)
     }
 
-    /// Reset per-meeting overlay state (health banner, skipped-cue counter,
-    /// dismissed-for-meeting). Call at meeting start, alongside
-    /// `CoachOrchestrator.beginMeeting()`.
+    /// Reset per-meeting overlay state (health banner, dismissed-for-meeting).
+    /// Call at meeting start, alongside `CoachListener.beginMeeting()`.
     public func prepareForNewMeeting() {
         state.health.resetForNewMeeting()
         state.dismissState.reopen()
@@ -290,9 +285,11 @@ public final class CoachOverlayController {
     /// button / ⌥esc): the panel orders out and incoming cards no longer
     /// repopulate it.
     ///
-    /// The pipeline keeps running — detections still land in the
-    /// recent-cues log. Reopen via `reopen()` (or any explicit `present`, e.g.
-    /// the manual trigger), and a new meeting always starts fresh.
+    /// The coordinator observes the same notification and PAUSES the
+    /// listener's automatic checks — each is a paid cloud call that would
+    /// produce cards nobody sees. Reopen via `reopen()` (or any explicit
+    /// `present`, e.g. the manual trigger) resumes them, and a new meeting
+    /// always starts fresh.
     public func dismissForMeeting() {
         state.dismissState.dismissForMeeting()
         state.activeCard = nil
@@ -334,10 +331,14 @@ public final class CoachOverlayController {
     /// fallback (registered by the coordinator) handles it during a call when
     /// another app is frontmost.
     private func installKeyMonitor() {
-        keyMonitorBox.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            // ⌥esc: option held + escape (keyCode 53).
+        keyMonitorBox.monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            // ⌥esc: option held + escape (keyCode 53). POST the dismiss like
+            // every other dismiss path (button, global hotkey) — the
+            // coordinator observes the same notification to PAUSE the
+            // listener's paid checks. Calling dismissForMeeting() directly
+            // here would hide the overlay while the meter kept running.
             if event.keyCode == 53, event.modifierFlags.contains(.option) {
-                MainActor.assumeIsolated { self?.dismissForMeeting() }
+                NotificationCenter.default.post(name: .traceCoachOverlayDismiss, object: nil)
                 return nil
             }
             return event
@@ -605,7 +606,6 @@ public enum CoachOverlayMode: Sendable {
 public final class CoachOverlayStateModel {
     public var projectName: String = "—"
     public var activeCard: CoachCard?
-    public var conversationState: String = ""
     public var recentTriggers: [RecentTrigger] = []
     /// Surface state: starts compact (listening pill) so a meeting never auto-pops
     /// a full panel; a real card flips it to `.card`.
@@ -615,8 +615,8 @@ public final class CoachOverlayStateModel {
     /// True while the mouse hovers the collapsed pill — reveals the Ask chips and
     /// grows the pill frame to fit them (see `syncFrameToMode`).
     public var pillHovered: Bool = false
-    /// Health banner + skipped-cues state, driven by orchestrator health events
-    /// via `CoachOverlayController.applyHealthEvent`. The model (in CoachModule)
+    /// Health banner state, driven by listener health events via
+    /// `CoachOverlayController.applyHealthEvent`. The model (in CoachModule)
     /// owns the dismissal/rate-limit rules so they're testable without AppKit.
     public var health = CoachHealthBannerModel()
     /// Dismissed-for-meeting state (the "Dismiss" button / ⌥esc) — model-level
@@ -627,20 +627,11 @@ public final class CoachOverlayStateModel {
 }
 
 extension CoachCard {
-    /// Whether the card has anything worth showing (lead, body, or points).
+    /// Whether the card has anything worth showing.
     ///
-    /// A
-    /// silent/empty routing result is `.isEmpty == true` and must not pop a card.
+    /// An empty body must not pop a card.
     var isEmpty: Bool {
-        lead.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && points.allSatisfy { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-    }
-
-    /// The accented say-this line: `lead` when present, else the legacy `body`.
-    var displayLead: String {
-        let trimmed = lead.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? body : lead
+        body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
@@ -684,15 +675,10 @@ struct CoachOverlayRootView: View {
 
     // MARK: Auto-dismiss
 
-    /// Auto-dismiss passive cards after the timeout (paused while hovered).
-    ///
-    /// Keeps
-    /// interactive (pacing/agenda) cards until the user acts on them.
+    /// Auto-dismiss cards after the timeout (paused while hovered).
     private func tickAutoDismiss() {
         guard state.mode == .card, !hovering else { return }
-        guard let card = state.activeCard, card.surface == .passive,
-            let surfacedAt = state.surfacedAt
-        else { return }
+        guard state.activeCard != nil, let surfacedAt = state.surfacedAt else { return }
         if now.timeIntervalSince(surfacedAt) > Self.autoDismissSeconds {
             state.activeCard = nil
             state.mode = .compact
@@ -927,61 +913,49 @@ struct CoachOverlayRootView: View {
     }
 
     private func cueCard(_ card: CoachCard) -> some View {
-        let trust = Self.trustBadge(for: card.mode)
+        let badge = Self.kindBadge(for: card)
         return VStack(alignment: .leading, spacing: 9) {
-            // mode badge — one restrained per-mode dot, not everything orange —
+            // kind badge — one restrained per-kind dot, not everything orange —
             // plus the cue's surfacing time, so a card that's been sitting there
             // can't masquerade as fresh.
             HStack(spacing: 6) {
-                Circle().fill(Self.modeColor(card.mode, scheme: scheme, palette: palette)).frame(width: 6, height: 6)
-                Text(trust.label)
+                Circle().fill(Self.kindColor(card.kind, scheme: scheme, palette: palette)).frame(width: 6, height: 6)
+                Text(badge)
                     .font(BrutalistTypography.captionEmphasis)
                     .foregroundStyle(palette.fgMuted.color)
                 Spacer()
                 Text(card.createdAt, style: .time)
                     .font(BrutalistTypography.caption)
                     .foregroundStyle(palette.fgMuted.color)
-                    .help("When this cue surfaced")
+                    .help("When this card surfaced")
             }
-            // context (what they asked)
+            // context (what this card is about)
             if !card.title.isEmpty {
                 Text(card.title)
                     .font(BrutalistTypography.caption)
                     .foregroundStyle(palette.fgMuted.color)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            // the single accented say-this line, clamps with Show more
-            leadView(card)
-            // supporting bullets
-            if !card.points.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    ForEach(Array(card.points.enumerated()), id: \.offset) { _, point in
-                        HStack(alignment: .top, spacing: 8) {
-                            Text("›")
-                                .font(BrutalistTypography.labelEmphasis)
-                                .foregroundStyle(palette.primary.color)
-                            Text(point)
-                                .font(BrutalistTypography.body)
-                                .foregroundStyle(palette.fg.color)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                    }
-                }
+            // the card body, accented with a left-rule; clamps with Show more
+            bodyView(card)
+            // grounding quote — the verbatim line from the user's notes this
+            // card stands on, shown so trust is inspectable at a glance.
+            if card.isGrounded {
+                groundingView(card)
             }
-            // source / trust line
-            sourceRow(card, grounded: trust.grounded)
+            sourceRow(card)
         }
         .padding(13)
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// The accented "say this" line with a left-rule.
+    /// The accented card body with a left-rule.
     ///
-    /// Long leads clamp to a few
+    /// Long bodies clamp to a few
     /// lines and reveal a Show more / Show less toggle.
     @ViewBuilder
-    private func leadView(_ card: CoachCard) -> some View {
-        let text = card.displayLead
+    private func bodyView(_ card: CoachCard) -> some View {
+        let text = card.body
         if !text.isEmpty {
             VStack(alignment: .leading, spacing: 6) {
                 HStack(alignment: .top, spacing: 0) {
@@ -1006,20 +980,39 @@ struct CoachOverlayRootView: View {
         }
     }
 
-    private func sourceRow(_ card: CoachCard, grounded: Bool) -> some View {
-        HStack(spacing: 5) {
+    /// The verbatim quote from the user's notes a grounded card stands on.
+    private func groundingView(_ card: CoachCard) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "text.quote")
+                .font(.system(size: 9))
+                .foregroundStyle(palette.fgMuted.color)
+                .padding(.top, 2)
+            Text("“\(card.grounding)”")
+                .font(BrutalistTypography.caption)
+                .italic()
+                .foregroundStyle(palette.fgMuted.color)
+                .fixedSize(horizontal: false, vertical: true)
+                .lineLimit(3)
+            Spacer(minLength: 0)
+        }
+        .padding(.leading, 2)
+    }
+
+    private func sourceRow(_ card: CoachCard) -> some View {
+        let grounded = card.isGrounded
+        return HStack(spacing: 5) {
             Image(systemName: grounded ? "doc.text.magnifyingglass" : "sparkles")
                 .font(.system(size: 9))
                 .foregroundStyle(grounded ? palette.fgMuted.color : palette.fgSidebar.color.opacity(0.7))
-            Text(sourceLabel(for: card, grounded: grounded))
+            Text(grounded ? "From your notes" : "AI · general knowledge")
                 .font(BrutalistTypography.caption)
                 .foregroundStyle(grounded ? palette.fgMuted.color : palette.fgSidebar.color.opacity(0.7))
                 .lineLimit(2)
             Spacer(minLength: 0)
         }
         .padding(.top, 1)
-        // Ungrounded "general knowledge" reads visibly lower-key than a grounded
-        // doc source (trust gradient).
+        // Ungrounded general knowledge reads visibly lower-key than a grounded
+        // notes source (trust gradient).
         .opacity(grounded ? 1 : 0.85)
     }
 
@@ -1042,25 +1035,10 @@ struct CoachOverlayRootView: View {
 
     private var detailsSection: some View {
         VStack(alignment: .leading, spacing: 14) {
-            conversationStateRow
             recentLog
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
-    }
-
-    @ViewBuilder
-    private var conversationStateRow: some View {
-        if !state.conversationState.isEmpty {
-            HStack(spacing: 7) {
-                Circle().fill(palette.primary.color).frame(width: 5, height: 5)
-                Text(state.conversationState)
-                    .font(BrutalistTypography.caption)
-                    .foregroundStyle(palette.fg.color)
-                    .lineLimit(2)
-                Spacer(minLength: 0)
-            }
-        }
     }
 
     private var recentLog: some View {
@@ -1070,23 +1048,13 @@ struct CoachOverlayRootView: View {
                     .font(BrutalistTypography.groupTitle)
                     .foregroundStyle(palette.fgMuted.color)
                 Spacer()
+                // Withholding is never silent: cards held back by the budget or
+                // the spacing gate land here greyed out, so the count is honest.
                 let surfaced = state.recentTriggers.filter(\.wasSurfaced).count
-                Text("\(surfaced) surfaced · \(state.recentTriggers.count) detected")
+                let withheld = state.recentTriggers.count - surfaced
+                Text(withheld > 0 ? "\(surfaced) shown · \(withheld) held back" : "\(surfaced) shown")
                     .font(BrutalistTypography.caption)
                     .foregroundStyle(palette.fgMuted.color)
-            }
-            // Load shedding is never silent: when concurrency pressure skips
-            // cues, say so here (subtle, but visible).
-            if let skipped = state.health.skippedCueMessage {
-                HStack(spacing: 6) {
-                    Image(systemName: "forward.end")
-                        .font(.system(size: 8))
-                        .foregroundStyle(palette.fgMuted.color)
-                    Text(skipped)
-                        .font(BrutalistTypography.caption)
-                        .foregroundStyle(palette.fgMuted.color)
-                    Spacer(minLength: 0)
-                }
             }
             ForEach(state.recentTriggers) { trigger in
                 HStack(spacing: 8) {
@@ -1097,11 +1065,16 @@ struct CoachOverlayRootView: View {
                         .font(BrutalistTypography.label)
                         .foregroundStyle(trigger.wasSurfaced ? palette.fg.color : palette.fgSidebar.color)
                         .lineLimit(1)
+                    if !trigger.wasSurfaced {
+                        Text("held back")
+                            .font(BrutalistTypography.caption)
+                            .foregroundStyle(palette.fgMuted.color)
+                    }
                     Spacer()
                     Text(trigger.timestamp, style: .time)
                         .font(BrutalistTypography.caption)
                         .foregroundStyle(palette.fgMuted.color)
-                    Text(trigger.mode.rawValue.capitalized)
+                    Text(Self.kindLabel(trigger.kind))
                         .font(BrutalistTypography.caption)
                         .foregroundStyle(palette.fgMuted.color)
                 }
@@ -1110,38 +1083,35 @@ struct CoachOverlayRootView: View {
         }
     }
 
-    // MARK: Trust + mode treatment
+    // MARK: Trust + kind treatment
 
-    private static func trustBadge(for mode: CoachCardMode) -> (label: String, grounded: Bool) {
-        switch mode {
-        case .grounded: return ("From your docs", true)
-        case .synthesized: return ("From your playbook", true)
-        case .general: return ("General AI", false)
-        case .reframe: return ("A nudge", false)
-        case .agenda: return ("Agenda", false)
-        case .silent: return ("—", false)
+    private static func kindBadge(for card: CoachCard) -> String {
+        switch card.kind {
+        case .answer: return card.isGrounded ? "Answer · from your notes" : "Answer"
+        case .recall: return "From your notes"
+        case .suggestion: return "Try saying"
         }
     }
 
-    /// One restrained per-mode accent dot (not everything orange).
+    static func kindLabel(_ kind: CoachCardKind) -> String {
+        switch kind {
+        case .answer: return "Answer"
+        case .recall: return "Recall"
+        case .suggestion: return "Suggestion"
+        }
+    }
+
+    /// One restrained per-kind accent dot (not everything orange).
     ///
     /// Pulls from the
     /// shared semantic palette so green/blue/amber read correctly in both schemes.
-    private static func modeColor(_ mode: CoachCardMode, scheme: ColorScheme, palette: BrutalistPalette) -> Color {
+    private static func kindColor(_ kind: CoachCardKind, scheme: ColorScheme, palette: BrutalistPalette) -> Color {
         let semantic = BrutalistPalette.semantic(scheme)
-        switch mode {
-        case .grounded, .synthesized: return semantic.success.color  // green = grounded
-        case .general: return semantic.info.color  // blue = AI
-        case .reframe: return semantic.warning.color  // amber = nudge
-        case .agenda: return semantic.info.color
-        case .silent: return palette.fgMuted.color
+        switch kind {
+        case .recall: return semantic.success.color  // green = from your notes
+        case .answer: return semantic.info.color  // blue = answer
+        case .suggestion: return semantic.warning.color  // amber = a nudge
         }
-    }
-
-    private func sourceLabel(for card: CoachCard, grounded: Bool) -> String {
-        let trimmed = card.attribution.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty { return trimmed }
-        return grounded ? "From your playbook" : "General knowledge"
     }
 }
 

@@ -34,8 +34,12 @@ final class BootstrapConfigTests: XCTestCase {
         XCTAssertEqual(cfg.llmRoutes[.dictationCleanup]?.provider, .appleFM)
         XCTAssertEqual(cfg.llmRoutes[.titleGeneration]?.provider, .appleFM)
         XCTAssertEqual(cfg.llmRoutes[.projectCategorization]?.provider, .appleFM)
-        XCTAssertEqual(cfg.llmRoutes[.coachSmartRouting]?.provider, .appleFM)
-        XCTAssertEqual(cfg.llmRoutes[.coachCardContent]?.provider, .appleFM)
+        XCTAssertEqual(cfg.llmRoutes[.coachSmartRouting]?.provider, .appleFM)  // retired task class
+        // The coach is cloud-only, on Flash Lite by the owner's cost call —
+        // 3.5-flash (the bench's 10/10 pick) stays available in Settings.
+        XCTAssertEqual(cfg.llmRoutes[.coachCardContent]?.provider, .openAICompat)
+        XCTAssertEqual(cfg.llmRoutes[.coachCardContent]?.model, "google/gemini-3.1-flash-lite")
+        XCTAssertEqual(cfg.llmRoutes[.coachCardContent]?.keychainAccount, "openrouter")
         XCTAssertEqual(cfg.llmRoutes[.conversationStateExtractor]?.provider, .appleFM)
         XCTAssertEqual(cfg.llmRoutes[.meetingSummary]?.provider, .openAICompat)
         XCTAssertEqual(cfg.llmRoutes[.meetingAugmentedMerge]?.provider, .openAICompat)

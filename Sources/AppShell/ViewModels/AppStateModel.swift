@@ -263,7 +263,8 @@ public final class AppStateModel {
     /// provider is set + persisted + its config-changed notification posted, so
     /// the routes take effect live; per-provider model overrides are preserved.
     public func applyRoutePreset(_ preset: LLMRoutePreset) {
-        for stage in LLMRouteStage.allCases {
+        // `userConfigurable` — presets never touch the retired coach-routing stage.
+        for stage in LLMRouteStage.userConfigurable {
             setProvider(preset.provider(for: stage), for: stage)
         }
     }
@@ -272,7 +273,7 @@ public final class AppStateModel {
     /// `nil` (= "Custom") when the user has deviated from all presets.
     public var activeRoutePreset: LLMRoutePreset? {
         LLMRoutePreset.allCases.first { preset in
-            LLMRouteStage.allCases.allSatisfy { provider(for: $0) == preset.provider(for: $0) }
+            LLMRouteStage.userConfigurable.allSatisfy { provider(for: $0) == preset.provider(for: $0) }
         }
     }
 
@@ -576,33 +577,21 @@ public final class AppStateModel {
         }
     }
 
-    /// The LLM stages that make up the live in-meeting coach — the card content
-    /// the user reads as "the coach", the smart-routing classifier behind it, and
-    /// the running conversation-state summary that grounds it.
-    ///
-    /// Configured as ONE
-    /// choice in Settings → Coach (the user shouldn't pick a model three times);
-    /// power users can still override an individual stage in the LLM Router
-    /// (Advanced). `.coachCardContent` is the canonical stage the group reads.
-    public static let coachAIStages: [LLMRouteStage] = [.coachCardContent, .coachSmartRouting, .conversationState]
+    /// The single LLM stage behind the live in-meeting coach. The listener
+    /// redesign collapsed the old three-stage group (card content + smart
+    /// routing + conversation state) onto `.coachCardContent` alone:
+    /// `.coachSmartRouting` is retired, and `.conversationState` belongs to the
+    /// meeting-summary pipeline (its final digest), not the coach.
+    public static let coachAIStages: [LLMRouteStage] = [.coachCardContent]
 
-    /// The single "Coach AI model" provider that drives every `coachAIStages`
-    /// stage.
+    /// The "Coach AI model" provider — a projection over `.coachCardContent`.
     ///
-    /// Setting it fans the choice (provider AND the active model) out to all
-    /// of them, so the coach always runs on one coherent model unless individually
-    /// overridden in the Advanced LLM Router. Reads from `.coachCardContent`.
-    /// The MODEL fan-out across `coachAIStages` is done by the settings UI via
-    /// `StageModelRow.mirrorStages` — keep the two in sync if either changes.
+    /// Cloud-only by design: the Settings picker offers only connected cloud
+    /// providers, and the coordinator refuses to start the coach without one
+    /// (`CoachCloudGate`).
     public var coachAIProvider: DictationCleanupProvider {
         get { provider(for: .coachCardContent) }
-        set {
-            let model = model(for: .coachCardContent, provider: newValue)
-            for stage in Self.coachAIStages {
-                setProvider(newValue, for: stage)
-                setModel(model, for: stage, provider: newValue)
-            }
-        }
+        set { setProvider(newValue, for: .coachCardContent) }
     }
 
     /// Provider for cross-meeting Q&A / library search (`.libraryQA`).
@@ -683,9 +672,9 @@ public final class AppStateModel {
             NotificationCenter.default.post(name: .traceCoachConfigChanged, object: nil)
         }
     }
-    /// Behavior config for the in-meeting Coach — which card modes may surface,
-    /// the per-meeting surface budget, adaptive throttle, the optional
-    /// anti-fabrication post-check, and the manual triple-tap trigger.
+    /// Behavior config for the in-meeting Coach — the rolling card allowance
+    /// (cards per trailing window), the check cadence, and the manual
+    /// triple-tap trigger.
     ///
     /// The master
     /// on/off is `coachEnabled`; this is consulted while Coach is enabled.
@@ -1093,9 +1082,14 @@ public final class AppStateModel {
     public func applyAIMode(_ mode: AIMode) {
         // The generative stages onboarding speaks for. We deliberately route the
         // whole set to one provider here; power users re-split them in Settings.
+        // The coach stage (`.coachCardContent`) is handled separately below: it
+        // is cloud-only by design, so the local modes leave it untouched (it
+        // keeps its cloud default/choice) — routing it to a local provider would
+        // only guarantee the cloud-gate refusal. `.coachSmartRouting` is retired
+        // and never routed.
         let generativeStages: [LLMRouteStage] = [
             .dictationCleanup, .meetingNotes, .meetingTitle, .meetingCategorization,
-            .libraryQA, .conversationState, .coachSmartRouting, .coachCardContent,
+            .libraryQA, .conversationState,
         ]
         switch mode {
         case .off:
@@ -1109,6 +1103,10 @@ public final class AppStateModel {
         case .cloud(let provider):
             for stage in generativeStages {
                 setProvider(provider, for: stage)
+            }
+            // A cloud provider can also power the (cloud-only) coach stage.
+            if provider.isCloudCapable {
+                setProvider(provider, for: .coachCardContent)
             }
             meetingLiveSummaryEnabled = true
         case .appleFM:

@@ -23,10 +23,21 @@ public enum LLMRouteStage: String, Sendable, Hashable, CaseIterable, Identifiabl
     case meetingCategorization
     case libraryQA
     case conversationState
+    /// RETIRED: the old coach gatekeeper pipeline's classify/route stage. The
+    /// listener redesign collapsed the coach onto `.coachCardContent` alone.
+    /// The case survives only for persistence compatibility — its UserDefaults
+    /// keys may exist on disk and `LLMTaskClass.coachSmartRouting` may appear
+    /// in stored per-project override JSON. It is excluded from
+    /// `userConfigurable`, so no picker offers it and no preset touches it.
     case coachSmartRouting
     case coachCardContent
 
     public var id: String { rawValue }
+
+    /// The stages users can actually route — everything except the retired
+    /// `.coachSmartRouting`. Settings tables, presets, and active-preset
+    /// detection all iterate this, never `allCases`.
+    public static let userConfigurable: [LLMRouteStage] = allCases.filter { $0 != .coachSmartRouting }
 
     /// Human-readable stage name for the Advanced per-task routing table.
     public var displayName: String {
@@ -37,8 +48,8 @@ public enum LLMRouteStage: String, Sendable, Hashable, CaseIterable, Identifiabl
         case .meetingCategorization: return "Filing meetings into projects"
         case .libraryQA: return "Answering questions about your library"
         case .conversationState: return "Following the conversation"
-        case .coachSmartRouting: return "Deciding what the coach shows"
-        case .coachCardContent: return "Writing coach tips"
+        case .coachSmartRouting: return "Deciding what the coach shows (retired)"
+        case .coachCardContent: return "Meeting coach"
         }
     }
 
@@ -92,15 +103,17 @@ public enum LLMRouteStage: String, Sendable, Hashable, CaseIterable, Identifiabl
         }
     }
 
-    /// Provider when nothing is persisted yet — all-local defaults.
+    /// Provider when nothing is persisted yet.
     ///
-    /// Dictation
-    /// cleanup starts at the deterministic fixer; library Q&A at local Ollama;
-    /// everything else at on-device Apple FM.
+    /// Dictation cleanup starts at
+    /// the deterministic fixer; library Q&A at local Ollama; the meeting coach
+    /// at OpenRouter (the coach is cloud-only by design — it refuses to run on
+    /// a local model); everything else at on-device Apple FM.
     public var defaultProvider: DictationCleanupProvider {
         switch self {
         case .dictationCleanup: return .deterministic
         case .libraryQA: return .ollama
+        case .coachCardContent: return .openRouter
         default: return .appleFM
         }
     }
@@ -128,6 +141,9 @@ public enum LLMRouteStage: String, Sendable, Hashable, CaseIterable, Identifiabl
         switch self {
         case .dictationCleanup: return [.deterministic, .appleFM, .ollama]
         case .libraryQA: return [.ollama]
+        // Cloud-only: the coach offers NO local providers — its picker shows
+        // only the connected cloud set from `everydayProviders`.
+        case .coachCardContent: return []
         default: return [.appleFM, .ollama]
         }
     }

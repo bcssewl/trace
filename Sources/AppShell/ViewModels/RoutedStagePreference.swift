@@ -24,6 +24,12 @@ struct RoutedStagePreference: Sendable {
             .flatMap(DictationCleanupProvider.init(rawValue:)) ?? stage.defaultProvider
         if restored == .deterministic, let coerced = stage.deterministicCoercion {
             self.provider = coerced
+        } else if stage == .coachCardContent, !restored.isCloudCapable {
+            // The coach is cloud-only (the listener redesign). A preference
+            // persisted by an older build may still say Apple FM / Ollama —
+            // coerce to the cloud default so an upgrade lands on a runnable
+            // route instead of a guaranteed refusal.
+            self.provider = stage.defaultProvider
         } else {
             self.provider = restored
         }

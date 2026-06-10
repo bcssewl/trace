@@ -1,0 +1,26 @@
+{
+  "name": "recall-from-notes",
+  "description": "A sales call where the counterpart asks exactly the question the user's pricing playbook answers (the Aurora tier's 18% Atlas-threshold discount). A good companion resurfaces the playbook fact with a verbatim grounding quote. Skipped loudly if the embedding model is unreachable.",
+  "kbDocs": [
+    {
+      "title": "Pricing playbook — Aurora tier",
+      "content": "# Aurora tier pricing\n\nAurora is the enterprise tier. List price is £68 per seat per month, billed annually.\n\n## Discount policy (the Atlas threshold)\n\nAnnual commitments of 40 seats or more qualify for an 18% discount off list — internally this is called the Atlas threshold. Never offer more than 18% without written CFO sign-off. Starter and Scale tiers are strictly discount-free.\n\n## Payment terms\n\nStandard terms are 30 days. Quarterly billing adds 4% to list and waives the Atlas discount entirely."
+    }
+  ],
+  "utterances": [
+    { "t": 0, "speaker": "Marta (Brightwell)", "text": "Thanks for making time again. We've socialised the proposal internally since last week." },
+    { "t": 15, "speaker": "You", "text": "Glad to hear it. Where did the team land?" },
+    { "t": 30, "speaker": "Marta (Brightwell)", "text": "Broadly positive. Finance wants us on the Aurora tier, but the sticker price raised some eyebrows." },
+    { "t": 45, "speaker": "You", "text": "That's the enterprise tier, so there's some room depending on the shape of the commitment." },
+    { "t": 62, "speaker": "Marta (Brightwell)", "text": "That's what I hoped. If we committed for a full year at around fifty seats, what discount could you actually do on Aurora?" },
+    { "t": 78, "speaker": "You", "text": "Let me be precise rather than guess — give me one second to check our commercial guardrails." },
+    { "t": 95, "speaker": "Marta (Brightwell)", "text": "Of course." },
+    { "t": 110, "speaker": "Marta (Brightwell)", "text": "While you look — procurement will also ask about payment terms." },
+    { "t": 125, "speaker": "You", "text": "Standard is thirty days; we can talk quarterly billing, though it changes the numbers." },
+    { "t": 142, "speaker": "Marta (Brightwell)", "text": "Understood. Annual up front is likely fine if the discount works." },
+    { "t": 158, "speaker": "You", "text": "Then I think we'll find a happy landing. I'll send the formal quote tomorrow morning." }
+  ],
+  "expect": [
+    { "type": "recall_with_grounding", "keywords": ["18", "Atlas", "40 seats"] }
+  ]
+}

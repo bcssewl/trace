@@ -1,11 +1,20 @@
 import Foundation
 import SharedCore
 
-// Dev-only replay harness: feed a recorded audio file through the REAL Parakeet
-// backend (the same engine meetings use) and print the transcript — so meeting
-// transcription can be tested and diffed without sitting through a live meeting.
+// Dev-only replay harness with two modes:
 //
-// Usage:  swift run TraceReplay <audio-file> [--locale es_ES]
+// 1. Audio replay: feed a recorded audio file through the REAL Parakeet backend
+//    (the same engine meetings use) and print the transcript — so meeting
+//    transcription can be tested and diffed without sitting through a live
+//    meeting.
+//
+//      Usage:  swift run TraceReplay <audio-file> [--locale es_ES]
+//
+// 2. Coach bench: replay scripted meeting scenarios through the REAL
+//    CoachListener against the REAL routed cloud model, with a virtual clock,
+//    and report behaviour versus expectations (see CoachBench.swift).
+//
+//      Usage:  swift run TraceReplay coach-bench <scenarios-dir> [--only <name>]
 //
 // Uses top-level `await` (SwiftPM's implicit async main). No MainActor work here,
 // so the async entry is safe — and a Task{}+semaphore bridge actually deadlocks
@@ -16,7 +25,11 @@ func err(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
 let args = CommandLine.arguments
 guard args.count >= 2 else {
     err("usage: trace-replay <audio-file> [--locale en_US]")
+    err("       trace-replay coach-bench <scenarios-dir> [--only <name>]")
     exit(2)
+}
+if args[1] == "coach-bench" {
+    exit(await CoachBench.run(arguments: Array(args.dropFirst(2))))
 }
 let url = URL(fileURLWithPath: args[1])
 var localeID = "en_US"

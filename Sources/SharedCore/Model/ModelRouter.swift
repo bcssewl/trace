@@ -124,8 +124,18 @@ public actor ModelRouter {
         .projectCategorization: ModelProvider.appleFM.route(model: "apple-fm-default"),
         .meetingSummary: ModelProvider.openRouter.route(model: "openai/gpt-5"),
         .meetingAugmentedMerge: ModelProvider.openRouter.route(model: "openai/gpt-5"),
+        // Retired task class (the old coach gatekeeper pipeline). The case
+        // survives only for persistence compatibility — per-project override
+        // JSON may still carry it; nothing calls through it any more.
         .coachSmartRouting: ModelProvider.appleFM.route(model: "apple-fm-default"),
-        .coachCardContent: ModelProvider.appleFM.route(model: "apple-fm-default"),
+        // The coach is cloud-only by design (it needs a capable model). Default
+        // is Flash LITE by the owner's explicit cost call: the coach bench
+        // (BenchScenarios/coach) scored it 9/10 with the code gates policing
+        // its eagerness (duplicates + unverifiable recalls die mechanically);
+        // its one residual habit is restating settled moments. 3.5-flash
+        // scored 10/10 on its own judgement and sits in the Settings picker
+        // for whenever the trade is worth a few pence per meeting.
+        .coachCardContent: ModelProvider.openRouter.route(model: "google/gemini-3.1-flash-lite"),
         .libraryQA: ModelProvider.openRouter.route(model: "google/gemini-3.1-flash-lite"),
         .conversationStateExtractor: ModelProvider.appleFM.route(model: "apple-fm-default"),
     ]

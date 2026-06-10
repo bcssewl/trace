@@ -156,8 +156,18 @@ public struct BootstrapConfig: Sendable, Codable, Hashable {
             baseURL: URL(string: "https://openrouter.ai/api/v1"),
             keychainAccount: "openrouter"
         ),
+        // Retired task class (the old coach gatekeeper pipeline); kept only so
+        // persisted route tables that still mention it decode.
         .coachSmartRouting: LLMRoute(provider: .appleFM, model: "FoundationModels"),
-        .coachCardContent: LLMRoute(provider: .appleFM, model: "FoundationModels"),
+        // The coach is cloud-only by design. Flash Lite by the owner's cost
+        // call (bench: 9/10 with the code gates backstopping; 3.5-flash is the
+        // 10/10 pick available in Settings).
+        .coachCardContent: LLMRoute(
+            provider: .openAICompat,
+            model: "google/gemini-3.1-flash-lite",
+            baseURL: URL(string: "https://openrouter.ai/api/v1"),
+            keychainAccount: "openrouter"
+        ),
         .libraryQA: LLMRoute(
             provider: .openAICompat,
             model: "google/gemini-3.1-flash-lite",

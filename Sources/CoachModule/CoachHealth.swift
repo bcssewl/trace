@@ -1,53 +1,45 @@
 import Foundation
 
-/// The coach pipeline stages whose health is reported individually, because they
+/// The two coach stages whose health is reported individually, because they
 /// fail differently:
 ///
-/// - `embedding` failures DEGRADE the pipeline (cards still surface, just without
-///   grounding in the user's documents).
-/// - `classifier` / `router` failures PAUSE it (no card can be produced).
-public enum CoachPipelineStage: String, Sendable, Codable, Hashable, CaseIterable {
-    case embedding
-    case classifier
-    case router
+/// - `listener` failures PAUSE the coach (its cloud model isn't responding, or
+///   keeps returning unusable replies) — no card can be produced.
+/// - `search` failures DEGRADE it (the coach keeps checking, but can't pull
+///   snippets from the user's notes, so recall is limited to the transcript).
+public enum CoachStage: String, Sendable, Codable, Hashable, CaseIterable {
+    case listener
+    case search
 }
 
-/// A typed health event emitted by `CoachOrchestrator` so failures surface loudly
-/// (an overlay banner) instead of dying in a debug log.
+/// A typed health event emitted by `CoachListener` so failures surface loudly
+/// (an overlay banner + a coalesced notice) instead of dying in a debug log.
 ///
 /// Emission is EDGE-TRIGGERED per stage: a dead model produces exactly one
 /// `stageUnavailable` for its first failure, then stays quiet until it succeeds
-/// again (one `stageRecovered`), no matter how many utterances fail in between.
+/// again (one `stageRecovered`), no matter how many checks fail in between.
 /// That is the rate limit — the banner appears once per outage, not once per
-/// utterance.
+/// check.
 public enum CoachHealthEvent: Sendable, Hashable {
-    /// A stage's model just went from working to failing.
+    /// A stage just went from working to failing.
     /// `reason` is the underlying error's description (for logs/tooltips).
-    case stageUnavailable(stage: CoachPipelineStage, reason: String)
+    case stageUnavailable(stage: CoachStage, reason: String)
     /// A previously-failing stage just succeeded again.
-    case stageRecovered(stage: CoachPipelineStage)
-    /// An utterance was superseded under concurrency load (latest-wins queueing —
-    /// see `CoachOrchestrator.enqueue`). Carries the running per-meeting total so
-    /// the overlay can show "N cues skipped under load".
-    case cueSkipped(totalSkippedThisMeeting: Int)
+    case stageRecovered(stage: CoachStage)
 }
 
 /// Pure, testable state behind the overlay's health banner: which stages are
-/// failing, what (if anything) the banner says, what "dismiss" means, and the
-/// skipped-cues counter.
+/// failing, what (if anything) the banner says, and what "dismiss" means.
 ///
 /// Dismissal semantics: dismissing hides the banner for the CURRENT set of
 /// failing stages. If the situation changes — a different stage starts failing —
 /// the banner reappears (new information must not stay hidden behind an old
 /// dismissal). Recovery of all stages clears both the banner and the dismissal.
 public struct CoachHealthBannerModel: Sendable, Hashable {
-    public private(set) var failingStages: Set<CoachPipelineStage> = []
-    /// Running count of cues skipped under load this meeting (latest-wins
-    /// supersession in `CoachOrchestrator.enqueue`).
-    public private(set) var skippedCueCount = 0
+    public private(set) var failingStages: Set<CoachStage> = []
     /// The failing-stage set at the moment the user dismissed the banner; the
     /// banner stays hidden while the set is unchanged.
-    private var dismissedSignature: Set<CoachPipelineStage>?
+    private var dismissedSignature: Set<CoachStage>?
 
     public init() {}
 
@@ -63,8 +55,6 @@ public struct CoachHealthBannerModel: Sendable, Hashable {
         case .stageRecovered(let stage):
             failingStages.remove(stage)
             if failingStages.isEmpty { dismissedSignature = nil }
-        case .cueSkipped(let total):
-            skippedCueCount = total
         }
     }
 
@@ -74,36 +64,24 @@ public struct CoachHealthBannerModel: Sendable, Hashable {
         dismissedSignature = failingStages
     }
 
-    /// Reset at meeting start, mirroring `CoachOrchestrator.beginMeeting()`:
+    /// Reset at meeting start, mirroring `CoachListener.beginMeeting()`:
     /// a still-dead model re-raises on its first failure in the new meeting.
     public mutating func resetForNewMeeting() {
         failingStages = []
-        skippedCueCount = 0
         dismissedSignature = nil
     }
 
     /// The banner text to show, or nil when healthy or dismissed.
     ///
-    /// Model stages outrank embedding: "paused" is the bigger truth than
+    /// The listener stage outranks search: "paused" is the bigger truth than
     /// "degraded". British English throughout.
     public var activeMessage: String? {
         guard !failingStages.isEmpty, dismissedSignature != failingStages else { return nil }
-        if failingStages.contains(.router) || failingStages.contains(.classifier) {
-            return "Coach paused — model unavailable. Check Settings → Models."
+        if failingStages.contains(.listener) {
+            return "Coach paused — its model isn't responding. Check Settings → AI models."
         }
-        // Honest about the actual degradation: with embeddings down the
-        // relevance gate suppresses most automatic cues entirely — only obvious
-        // triggers (questions, asks) and manual requests still produce help.
         return
-            "Coach can't search your documents — automatic cues are limited to obvious triggers, and asking directly still works. Check Settings → Models."
-    }
-
-    /// The subtle expanded-overlay line for load shedding, or nil when none.
-    public var skippedCueMessage: String? {
-        guard skippedCueCount > 0 else { return nil }
-        return skippedCueCount == 1
-            ? "1 cue skipped under load"
-            : "\(skippedCueCount) cues skipped under load"
+            "Coach can't search your notes — cards may miss things from your documents, but answers and suggestions still work. Check Settings → AI models."
     }
 }
 
@@ -111,8 +89,11 @@ public struct CoachHealthBannerModel: Sendable, Hashable {
 /// HIDDEN FOR THE REST OF THE MEETING (no cards pop), as the button says — not
 /// minimised to the pill (that's "Minimise").
 ///
-/// Reopening is always possible: an explicit user action (manual trigger,
-/// menu-bar reopen, a new meeting starting) clears the dismissal.
+/// Dismissal also PAUSES the listener's automatic checks (each check is a paid
+/// cloud call that would produce cards nobody sees) — the coordinator wires
+/// that through `CoachListener.setAutoChecksPaused`. Reopening is always
+/// possible: an explicit user action (manual trigger, menu-bar reopen, a new
+/// meeting starting) clears the dismissal and resumes checking.
 public struct CoachOverlayDismissState: Sendable, Hashable {
     public private(set) var isDismissedForMeeting = false
 

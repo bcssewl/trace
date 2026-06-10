@@ -1,0 +1,21 @@
+{
+  "name": "moment-passed",
+  "description": "Priya can't remember a contract renewal deadline (phrased as a statement, so the cadence path — not the question fast-path — handles it); Dan answers correctly five seconds later, and the next check lands after the resolution. A good companion does not relitigate a resolved moment: no cards at all.",
+  "utterances": [
+    { "t": 0, "speaker": "Priya", "text": "Quick sync on the Hartley account before standup — won't take ten minutes." },
+    { "t": 12, "speaker": "You", "text": "Their legal team sent the redlines back this morning. Nothing scary at first glance." },
+    { "t": 25, "speaker": "Priya", "text": "Good. I can never keep their renewal deadline in my head. Dan, you had the signed copy." },
+    { "t": 30, "speaker": "Dan", "text": "Renewal is the fourteenth of March, with ninety days' notice either way. I checked the countersigned PDF yesterday." },
+    { "t": 38, "speaker": "Priya", "text": "The fourteenth, right. So notice by mid-December if anyone wanted out — which we don't." },
+    { "t": 48, "speaker": "You", "text": "Definitely not. Usage is up about forty per cent quarter on quarter." },
+    { "t": 60, "speaker": "Dan", "text": "Their procurement will still want the usage chart for the file." },
+    { "t": 72, "speaker": "You", "text": "I'll export it before Thursday." },
+    { "t": 85, "speaker": "Priya", "text": "Lovely. Last thing — the kickoff for the onboarding revamp moved to Tuesday." },
+    { "t": 100, "speaker": "Dan", "text": "Saw that. Same agenda, just shifted." },
+    { "t": 115, "speaker": "You", "text": "Works for me." },
+    { "t": 130, "speaker": "Priya", "text": "Then we're done early for once. Miracles happen." }
+  ],
+  "expect": [
+    { "type": "card_count_max", "max": 0 }
+  ]
+}

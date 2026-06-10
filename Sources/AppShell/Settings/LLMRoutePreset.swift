@@ -33,8 +33,11 @@ public enum LLMRoutePreset: String, Sendable, CaseIterable, Identifiable {
     /// The provider this preset assigns to `stage`.
     ///
     /// Local-first mirrors the
-    /// shipped all-local defaults exactly, so a fresh install reads as
-    /// "Local-first" rather than "Custom".
+    /// shipped defaults exactly, so a fresh install reads as "Local-first"
+    /// rather than "Custom". Note the meeting coach stage is cloud-only by
+    /// design (its default IS OpenRouter), so even "On your Mac" leaves it on
+    /// the cloud — the coach simply doesn't run on local models, and it is
+    /// opt-in/off by default anyway.
     public func provider(for stage: LLMRouteStage) -> DictationCleanupProvider {
         switch self {
         case .localFirst:
