@@ -45,11 +45,21 @@ struct MeetingLiveView: View {
 
     /// Loud persistence failures (transcript lines, notes, summary, session
     /// record) surfaced as dismissable warning banners across the whole view —
-    /// a disk problem is never log-only.
+    /// a disk problem is never log-only. The capture notice ("only recording
+    /// you") rides the same strip: a one-sided recording is a data-loss-grade
+    /// problem, so it gets a full banner, not just the small status chip.
     @ViewBuilder
     private var storageNoticeStrip: some View {
-        if !model.storageNotices.isEmpty {
+        if !model.storageNotices.isEmpty || model.captureNotice != nil {
             VStack(spacing: BrutalistMetrics.space1) {
+                if let capture = model.captureNotice {
+                    BrutalistBanner(
+                        kind: .warning,
+                        title: capture,
+                        actionTitle: "Dismiss",
+                        action: { model.setCaptureNotice(nil) }
+                    )
+                }
                 ForEach(model.storageNotices, id: \.self) { notice in
                     BrutalistBanner(
                         kind: .warning,
@@ -354,6 +364,24 @@ struct MeetingLiveView: View {
                                 Task { await model.chooseProject(candidate.id) }
                             }
                             .help("File in \(candidate.name)")
+                        }
+                        // The right project may not be in the top-3 chips (a
+                        // misfiled "Spanish lesson" once offered everything BUT
+                        // Spanish classes) — every project stays one tap away.
+                        if categorization.allProjects.count > categorization.candidates.count {
+                            Menu {
+                                ForEach(categorization.allProjects) { candidate in
+                                    Button(candidate.name) {
+                                        Task { await model.chooseProject(candidate.id) }
+                                    }
+                                }
+                            } label: {
+                                Text("All projects…")
+                                    .font(BrutalistTypography.caption)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .help("File this meeting in any project")
                         }
                         Spacer(minLength: 0)
                     }

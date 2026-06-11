@@ -18,17 +18,25 @@ public struct RecentTrigger: Sendable, Hashable, Identifiable {
     public let label: String
     public let kind: CoachCardKind
     public let wasSurfaced: Bool
+    /// The full card behind this log entry, kept so a cue can be REOPENED after
+    /// it auto-hides — a card that pops for twelve seconds and then becomes
+    /// unreachable reads as "I got a notification but there's nothing there".
+    public let card: CoachCard?
 
     /// Maximum stored label length; anything longer is truncated with an ellipsis
     /// (the overlay renders one line anyway).
     static let maxLabelLength = 80
 
-    public init(id: UUID = UUID(), timestamp: Date = Date(), label: String, kind: CoachCardKind, wasSurfaced: Bool) {
+    public init(
+        id: UUID = UUID(), timestamp: Date = Date(), label: String, kind: CoachCardKind,
+        wasSurfaced: Bool, card: CoachCard? = nil
+    ) {
         self.id = id
         self.timestamp = timestamp
         self.label = Self.sanitisedLabel(label, kind: kind)
         self.kind = kind
         self.wasSurfaced = wasSurfaced
+        self.card = card
     }
 
     /// Clamp an LLM-derived title to a renderable one-line label:

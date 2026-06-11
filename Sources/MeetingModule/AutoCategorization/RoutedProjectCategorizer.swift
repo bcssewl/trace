@@ -19,12 +19,20 @@ public struct RoutedProjectCategorizer: Sendable {
     }
 
     public func categorize(
-        _ input: MeetingCategorizationInput, projects: [ProjectCandidate], calendarTitle: String? = nil
+        _ input: MeetingCategorizationInput,
+        projects: [ProjectCandidate],
+        calendarTitle: String? = nil,
+        meetingTitle: String? = nil,
+        recentTitlesByProject: [UUID: [String]] = [:]
     ) async throws -> CategorizationResult {
         let baseResult = try await base.categorize(input, projects: projects)
         guard baseResult.bucket != .manualOverride, let classifier else { return baseResult }
         let pick = await classifier.classify(
-            transcriptPrefix: input.transcriptPrefix, calendarTitle: calendarTitle, projects: projects
+            transcriptPrefix: input.transcriptPrefix,
+            meetingTitle: meetingTitle,
+            calendarTitle: calendarTitle,
+            projects: projects,
+            recentTitlesByProject: recentTitlesByProject
         )
         return Self.merge(
             base: baseResult,

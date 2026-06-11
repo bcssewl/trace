@@ -236,20 +236,27 @@ public struct LiveMeetingSignalSource: MeetingSignalSourcing {
     /// Treated
     /// exactly like catalog apps for the `.appLaunch` signal.
     private let additionalMeetingAppIDs: Set<String>
+    /// Injectable mic probe (real CoreAudio by default) — both the `appLaunch`
+    /// and `browserTab` signals are gated on it, so tests must be able to pin
+    /// it rather than depend on the machine's actual input-device state.
+    private let micActiveProbe: @Sendable () -> Bool
 
     public init(
         browserReader: any BrowserTabReading = AppleScriptBrowserTabURLReader(),
-        additionalMeetingAppIDs: Set<String> = []
+        additionalMeetingAppIDs: Set<String> = [],
+        micActiveProbe: (@Sendable () -> Bool)? = nil
     ) {
         self.browserReader = browserReader
         self.additionalMeetingAppIDs = additionalMeetingAppIDs
+        // Internal static can't be a public default argument; resolve here.
+        self.micActiveProbe = micActiveProbe ?? { Self.defaultInputDeviceIsRunningSomewhere() }
     }
 
     public func currentSignals() async -> Set<MeetingActivitySignal> {
         var signals: Set<MeetingActivitySignal> = []
 
         let frontmostBundleID = Self.frontmostBundleID()
-        let micActive = Self.defaultInputDeviceIsRunningSomewhere()
+        let micActive = micActiveProbe()
 
         // App-launch signal: a known (or user-added) meeting app is frontmost
         // AND the mic is actually live. The mic gate is what separates "in a
@@ -273,8 +280,12 @@ public struct LiveMeetingSignalSource: MeetingSignalSourcing {
             signals.insert(.systemAudioEnergy)
         }
 
-        // Browser meeting tab.
-        if let bundleID = frontmostBundleID,
+        // Browser meeting tab. Gated on the mic being live for the same reason
+        // as `appLaunch` (a real call always opens the input device) — which
+        // also keeps the per-tick AppleScript from running while you merely
+        // browse, now that the detector polls every second.
+        if micActive,
+            let bundleID = frontmostBundleID,
             let tab = await browserReader.activeBrowserTab(frontmostBundleID: bundleID),
             tab.isMeetingURL || MeetingURLClassifier.isMeetingURL(tab.url)
         {

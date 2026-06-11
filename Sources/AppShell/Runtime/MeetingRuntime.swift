@@ -478,12 +478,14 @@ public final class MeetingRuntime {
     /// Detect the "authorized but deaf" system-audio case and surface it loudly
     /// instead of silently recording the mic only.
     ///
-    /// Fires when the tap is genuinely running (frames flowing) but has *never*
-    /// produced a non-silent buffer, while the Mac's default output is actively
-    /// playing audio — that combination means the System Audio Recording grant
-    /// isn't taking effect (e.g. a quarantined/translocated download), so the
-    /// other side is being dropped. The output-active check is what keeps a
-    /// genuinely quiet call (nobody talking yet) from tripping a false alarm.
+    /// Fires when the tap has *never* produced a non-silent buffer — whether it
+    /// is delivering all-zero frames (the permission-not-taking-effect case: the
+    /// tap "works" but macOS feeds it digital silence) or no frames at all (the
+    /// tap stalled outright) — while the Mac's default output is actively
+    /// playing audio. The output-active check is what keeps a genuinely quiet
+    /// call (nobody talking yet) from tripping a false alarm; once audio IS
+    /// playing out, fifteen silent seconds from a global tap means the other
+    /// side is being dropped, so warn fast enough to fix it mid-call.
     ///
     /// Self-healing: the instant any real audio is captured, the notice clears.
     private func checkSystemAudioHealth(elapsed: TimeInterval) async {
@@ -497,8 +499,7 @@ public final class MeetingRuntime {
             return
         }
         guard !systemAudioWarned,
-            elapsed >= 45,
-            diag.framesObserved > 0,
+            elapsed >= 15,
             SystemAudioCapture.isDefaultOutputActive()
         else { return }
         systemAudioWarned = true
@@ -506,7 +507,7 @@ public final class MeetingRuntime {
             "Only recording you — turn on System Audio Recording for Trace in System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording, then restart the meeting."
         )
         Loggers.meeting.error(
-            "System audio appears unauthorized: tap alive (frames=\(diag.framesObserved, privacy: .public)) but only silence captured while the default output is active — recording mic only. Surfaced capture notice → Screen & System Audio Recording."
+            "System audio appears unauthorized or stalled: frames=\(diag.framesObserved, privacy: .public), only silence captured while the default output is active — recording mic only. Surfaced capture notice → Screen & System Audio Recording."
         )
     }
 

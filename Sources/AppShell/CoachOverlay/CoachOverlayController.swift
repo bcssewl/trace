@@ -252,6 +252,12 @@ public final class CoachOverlayController {
         }
     }
 
+    /// Reflect whether the coach listener is actually running — drives the
+    /// truthful idle text (never claim "Listening…" while the engine is off).
+    public func setListening(_ listening: Bool) {
+        state.isListening = listening
+    }
+
     /// Apply a listener health event to the overlay: drives the status banner
     /// (model unavailable / recovered).
     ///
@@ -610,6 +616,10 @@ public final class CoachOverlayStateModel {
     /// Surface state: starts compact (listening pill) so a meeting never auto-pops
     /// a full panel; a real card flips it to `.card`.
     public var mode: CoachOverlayMode = .compact
+    /// True while the coach listener is actually running (set by the
+    /// coordinator at start/stop). Drives the truthful idle text — the panel
+    /// must never claim to be listening when the engine is off.
+    public var isListening: Bool = false
     /// When the current passive card was surfaced — drives the auto-dismiss timer.
     public var surfacedAt: Date?
     /// True while the mouse hovers the collapsed pill — reveals the Ask chips and
@@ -903,13 +913,37 @@ struct CoachOverlayRootView: View {
 
     // MARK: Cue card
 
+    /// The live card when one is up; otherwise the most recent surfaced cue
+    /// from this meeting (cards auto-hide after twelve seconds — without this
+    /// fallback, opening the panel right after a cue popped showed only the
+    /// listening placeholder, which read as the cue having vanished). Only an
+    /// untouched meeting shows the placeholder.
     @ViewBuilder
     private var cueSection: some View {
         if let card = state.activeCard, !card.isEmpty {
             cueCard(card)
+        } else if let last = lastSurfacedCard {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(spacing: 6) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: 9))
+                        .foregroundStyle(palette.fgMuted.color)
+                    Text("Earlier cue — kept from this meeting")
+                        .font(BrutalistTypography.caption)
+                        .foregroundStyle(palette.fgMuted.color)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 13)
+                .padding(.top, 10)
+                cueCard(last)
+            }
         } else {
             listeningRow
         }
+    }
+
+    private var lastSurfacedCard: CoachCard? {
+        state.recentTriggers.first(where: { $0.wasSurfaced && $0.card?.isEmpty == false })?.card
     }
 
     private func cueCard(_ card: CoachCard) -> some View {
@@ -1016,15 +1050,22 @@ struct CoachOverlayRootView: View {
         .opacity(grounded ? 1 : 0.85)
     }
 
+    /// Truthful idle row: "Listening…" ONLY while the listener is actually
+    /// running. A panel that says "listening" while the coach is off was a
+    /// silent dead state — it read as broken, not idle.
     private var listeningRow: some View {
         HStack(spacing: 9) {
-            Image(systemName: "waveform")
+            Image(systemName: state.isListening ? "waveform" : "moon.zzz")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(palette.fgMuted.color)
-            Text("Listening… cues appear when something useful comes up.")
-                .font(BrutalistTypography.label)
-                .foregroundStyle(palette.fgMuted.color)
-                .fixedSize(horizontal: false, vertical: true)
+            Text(
+                state.isListening
+                    ? "Listening… cues appear when something useful comes up."
+                    : "Coach isn’t running. It starts with your next meeting (Settings → Coach)."
+            )
+            .font(BrutalistTypography.label)
+            .foregroundStyle(palette.fgMuted.color)
+            .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
         .padding(14)
@@ -1057,28 +1098,41 @@ struct CoachOverlayRootView: View {
                     .foregroundStyle(palette.fgMuted.color)
             }
             ForEach(state.recentTriggers) { trigger in
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(trigger.wasSurfaced ? palette.primary.color : palette.accentBg.color)
-                        .frame(width: 5, height: 5)
-                    Text(trigger.label)
-                        .font(BrutalistTypography.label)
-                        .foregroundStyle(trigger.wasSurfaced ? palette.fg.color : palette.fgSidebar.color)
-                        .lineLimit(1)
-                    if !trigger.wasSurfaced {
-                        Text("held back")
+                // Rows with a stored card reopen it on click — a logged cue you
+                // can't get back to isn't a log, it's a tease.
+                Button {
+                    guard let card = trigger.card, !card.isEmpty else { return }
+                    state.activeCard = card
+                    // No auto-dismiss for a deliberately recalled card.
+                    state.surfacedAt = nil
+                    state.mode = .card
+                } label: {
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(trigger.wasSurfaced ? palette.primary.color : palette.accentBg.color)
+                            .frame(width: 5, height: 5)
+                        Text(trigger.label)
+                            .font(BrutalistTypography.label)
+                            .foregroundStyle(trigger.wasSurfaced ? palette.fg.color : palette.fgSidebar.color)
+                            .lineLimit(1)
+                        if !trigger.wasSurfaced {
+                            Text("held back")
+                                .font(BrutalistTypography.caption)
+                                .foregroundStyle(palette.fgMuted.color)
+                        }
+                        Spacer()
+                        Text(trigger.timestamp, style: .time)
+                            .font(BrutalistTypography.caption)
+                            .foregroundStyle(palette.fgMuted.color)
+                        Text(Self.kindLabel(trigger.kind))
                             .font(BrutalistTypography.caption)
                             .foregroundStyle(palette.fgMuted.color)
                     }
-                    Spacer()
-                    Text(trigger.timestamp, style: .time)
-                        .font(BrutalistTypography.caption)
-                        .foregroundStyle(palette.fgMuted.color)
-                    Text(Self.kindLabel(trigger.kind))
-                        .font(BrutalistTypography.caption)
-                        .foregroundStyle(palette.fgMuted.color)
+                    .padding(.vertical, 4)
+                    .contentShape(Rectangle())
                 }
-                .padding(.vertical, 4)
+                .buttonStyle(.plain)
+                .help(trigger.card == nil ? "" : "Show this cue again")
             }
         }
     }

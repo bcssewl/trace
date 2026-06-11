@@ -356,6 +356,18 @@ public final class AppStateModel {
             UserDefaults.standard.set(meetingAutoStartOnDetect, forKey: AppStateModel.meetingAutoStartKey)
         }
     }
+    /// Also detect calls in apps Trace doesn't recognise: when microphone and
+    /// system audio stay active together for a sustained stretch with no known
+    /// meeting app/URL in sight, offer to start (always a prompt, never an
+    /// auto-start). Default ON — lesson/tutoring platforms and niche call apps
+    /// are exactly the calls the catalog misses. Writing re-arms the detector.
+    public var meetingDetectUnlistedApps: Bool {
+        didSet {
+            UserDefaults.standard.set(
+                meetingDetectUnlistedApps, forKey: AppStateModel.meetingDetectUnlistedAppsKey)
+            NotificationCenter.default.post(name: .traceMeetingAutoDetectChanged, object: nil)
+        }
+    }
     /// Bundle IDs the user has explicitly switched OFF for meeting auto-detect
     /// (Settings → Meetings → Auto-detect apps).
     ///
@@ -975,6 +987,10 @@ public final class AppStateModel {
             UserDefaults.standard.object(forKey: AppStateModel.meetingAutoDetectKey) as? Bool ?? false
         self.meetingAutoStartOnDetect =
             UserDefaults.standard.object(forKey: AppStateModel.meetingAutoStartKey) as? Bool ?? false
+        // Default ON: catches calls on platforms the app catalog doesn't know
+        // (always prompts — the weak path never auto-starts).
+        self.meetingDetectUnlistedApps =
+            UserDefaults.standard.object(forKey: AppStateModel.meetingDetectUnlistedAppsKey) as? Bool ?? true
         if let data = UserDefaults.standard.data(forKey: AppStateModel.meetingMutedAppsKey),
             let decoded = try? JSONDecoder().decode(Set<String>.self, from: data)
         {
@@ -1165,6 +1181,7 @@ public final class AppStateModel {
     static let dictationEnterSendsKey = "app.trace.dictation.enterSends"
     static let meetingAutoDetectKey = "app.trace.meeting.autoDetectEnabled"
     static let meetingAutoStartKey = "app.trace.meeting.autoStartOnDetect"
+    static let meetingDetectUnlistedAppsKey = "app.trace.meeting.detectUnlistedApps"
     static let meetingMutedAppsKey = "app.trace.meeting.mutedApps"
     static let meetingCustomAppsKey = "app.trace.meeting.customApps"
     static let meetingSilenceThresholdKey = "app.trace.meeting.silenceThresholdSeconds"

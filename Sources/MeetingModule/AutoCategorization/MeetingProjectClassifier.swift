@@ -29,22 +29,47 @@ public struct MeetingProjectClassifier: Sendable {
 
     /// Pick the best project for the meeting, or `nil` (no projects, too little
     /// transcript, the model abstains/errs, or an unparseable / out-of-range reply).
+    ///
+    /// `meetingTitle` is the generated meeting title (available because title
+    /// generation runs before categorization) and `recentTitlesByProject` holds a
+    /// few titles of meetings already filed in each project — both are far more
+    /// reliable evidence than the raw transcript, whose ASR text can come out
+    /// garbled or in the wrong language entirely (a Spanish lesson once
+    /// auto-filed into "Romanian classes" off transcript noise alone).
     public func classify(
-        transcriptPrefix: String, calendarTitle: String?, projects: [ProjectCandidate]
+        transcriptPrefix: String,
+        meetingTitle: String? = nil,
+        calendarTitle: String?,
+        projects: [ProjectCandidate],
+        recentTitlesByProject: [UUID: [String]] = [:]
     ) async -> Pick? {
         guard !projects.isEmpty else { return nil }
         let trimmed = transcriptPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.split(whereSeparator: { $0.isWhitespace }).count >= 6 else { return nil }
 
         let numbered = projects.enumerated()
-            .map { "\($0.offset + 1). \($0.element.name)" }
+            .map { offset, project in
+                let examples = (recentTitlesByProject[project.id] ?? [])
+                    .map { Self.sanitisedExample($0) }
+                    .filter { !$0.isEmpty }
+                    .prefix(3)
+                let suffix = examples.isEmpty
+                    ? ""
+                    : " (already contains: \(examples.map { "“\($0)”" }.joined(separator: "; ")))"
+                return "\(offset + 1). \(project.name)\(suffix)"
+            }
             .joined(separator: "\n")
         var body = ""
         if let calendarTitle, !calendarTitle.isEmpty {
             body += "Calendar event: \(calendarTitle)\n\n"
         }
-        body += "Projects:\n\(numbered)\n\nMeeting transcript:\n"
-        body += AntiInjectionGuard.wrap(String(trimmed.prefix(2000)), source: .transcript)
+        body += "Projects:\n\(numbered)\n\n"
+        var untrusted = ""
+        if let meetingTitle = meetingTitle.map(Self.sanitisedExample), !meetingTitle.isEmpty {
+            untrusted += "Meeting title: \(meetingTitle)\n\n"
+        }
+        untrusted += "Transcript excerpts:\n\(String(trimmed.prefix(2000)))"
+        body += AntiInjectionGuard.wrap(untrusted, source: .transcript)
 
         let request = LLMRequest(
             messages: [
@@ -75,9 +100,27 @@ public struct MeetingProjectClassifier: Sendable {
     }
 
     static let systemPrompt = """
-        You match a meeting to the project it belongs to. Given a numbered list of \
-        projects and the meeting transcript, reply with ONLY a JSON object: \
+        You match a meeting to the project it belongs to. You are given a numbered \
+        list of the user's projects (some with titles of meetings already filed in \
+        them), and the meeting's own evidence: its title and transcript excerpts. \
+        Reply with ONLY a JSON object: \
         {"index": <project number, or 0 if none clearly match>, "confidence": <0.0-1.0>}. \
+        Weigh the evidence in this order: the meeting title and calendar event are \
+        the most reliable; the per-project example titles show what kind of meeting \
+        lives in each project; the transcript is automatic speech recognition output \
+        and may be garbled or even come out in the wrong language — when it \
+        conflicts with the title, trust the title. \
         Be conservative — use index 0 when unsure.
         """
+
+    /// One-line, length-clamped form of an LLM-derived title so it can sit
+    /// inside the prompt without control garbage or runaway length.
+    static func sanitisedExample(_ raw: String) -> String {
+        let collapsed =
+            raw
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        return String(collapsed.prefix(90))
+    }
 }

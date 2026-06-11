@@ -100,6 +100,10 @@ public final class AppRuntimeCoordinator {
     /// signals remain live (so an ongoing call isn't re-nagged), then lapses
     /// shortly after the call ends so the next call prompts fresh.
     private static let meetingDismissCooldown: TimeInterval = 120
+    /// Suppression key for weak-signal (audio-only) detections, which have no
+    /// meeting app to attribute — dismissing one quiets the weak path, not
+    /// whichever innocent app happened to be frontmost.
+    private static let weakSignalPromptKey = "trace.detect.weak-signal"
     /// Optional reference set by AppDelegate so the coordinator can drive the
     /// HUD on dictation/meeting/voice-memo lifecycle events.
     public weak var notchHUD: NotchHUDController?
@@ -618,9 +622,11 @@ public final class AppRuntimeCoordinator {
     /// Cancels any in-flight detector,
     /// then — only when the pref is ON and we are not already capturing —
     /// creates a FRESH `AppActivityMonitor` (its reducer latches and fires
-    /// `.meetingLikelyStarted` only once per instance) and polls it every ~2s.
-    /// On detection it starts the meeting and stops polling; `runStopMeeting`
-    /// re-arms for the next call. Default OFF means this never surprise-records.
+    /// `.meetingLikelyStarted` only once per instance) and polls it every
+    /// second, ticking once immediately so detection starts at t=0, not after
+    /// the first sleep. On detection it starts the meeting and stops polling;
+    /// `runStopMeeting` re-arms for the next call. Default OFF means this
+    /// never surprise-records.
     private func rearmMeetingAutoDetect() {
         autoDetectTask?.cancel()
         autoDetectTask = nil
@@ -628,21 +634,31 @@ public final class AppRuntimeCoordinator {
             autoDetectMonitor = nil
             return
         }
+        // The weak-signal fallback (mic + audio with no recognised app) is a
+        // Settings toggle — calls on platforms the catalog doesn't know are
+        // caught after a longer hold, and always prompt (never auto-start).
+        var config = MeetingActivityConfig.default
+        if !environment.state.meetingDetectUnlistedApps {
+            config.weakSignalStableDuration = nil
+        }
         let monitor = AppActivityMonitor(
-            source: LiveMeetingSignalSource(additionalMeetingAppIDs: environment.state.meetingCustomApps))
+            source: LiveMeetingSignalSource(additionalMeetingAppIDs: environment.state.meetingCustomApps),
+            config: config)
         autoDetectMonitor = monitor
         Loggers.meeting.info("Meeting auto-detect armed")
+        let pollNanos = UInt64(max(0.25, config.micPollInterval) * 1_000_000_000)
         autoDetectTask = Task { [weak self] in
             while true {
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                if Task.isCancelled { break }
                 let event = await monitor.tick(time: Date().timeIntervalSince1970)
                 if Task.isCancelled { break }
-                if event == .meetingLikelyStarted {
-                    Loggers.meeting.info("Meeting auto-detect fired")
-                    self?.handleMeetingDetected()
+                if case .meetingLikelyStarted(let strongSignal) = event {
+                    Loggers.meeting.info(
+                        "Meeting auto-detect fired (strong=\(strongSignal, privacy: .public))")
+                    self?.handleMeetingDetected(strongSignal: strongSignal)
                     break
                 }
+                try? await Task.sleep(nanoseconds: pollNanos)
+                if Task.isCancelled { break }
             }
         }
     }
@@ -653,20 +669,26 @@ public final class AppRuntimeCoordinator {
     /// or drop a notch "Call detected · <app>" prompt asking to start; the
     /// "Later"/✕ button or a timeout backs off briefly so a false positive
     /// (e.g. a WhatsApp voice note) doesn't nag.
-    private func handleMeetingDetected() {
+    ///
+    /// `strongSignal == false` means the detection came from the audio-only
+    /// fallback (no recognised meeting app/URL): always PROMPT — auto-start on
+    /// a weak signal could surprise-record something that isn't a call — and
+    /// don't blame the frontmost app, which may be unrelated (you might be in
+    /// your notes while the call runs elsewhere).
+    private func handleMeetingDetected(strongSignal: Bool = true) {
         // Never prompt while something else is already capturing (dictation,
         // voice memo, or a meeting). Avoids mic contention and spurious
         // "call detected" prompts while you're dictating.
         guard environment.state.activeCapture.mode == .idle else { return }
-        if environment.state.meetingAutoStartOnDetect {
+        if environment.state.meetingAutoStartOnDetect, strongSignal {
             runStartMeeting()
             return
         }
-        let app = NSWorkspace.shared.frontmostApplication
-        let bundleID = app?.bundleIdentifier ?? "unknown"
+        let app = strongSignal ? NSWorkspace.shared.frontmostApplication : nil
+        let bundleID = app?.bundleIdentifier ?? Self.weakSignalPromptKey
         // Explicit mute: the user switched this app off in Settings → never offer.
         // Keep watching so a DIFFERENT app (a genuine meeting) still prompts.
-        if environment.state.isMeetingAppMuted(bundleID) {
+        if strongSignal, environment.state.isMeetingAppMuted(bundleID) {
             Loggers.meeting.info("Auto-detect: \(bundleID, privacy: .public) muted by user; skipping")
             scheduleAutoDetectRearm(after: 20)
             return
@@ -2291,6 +2313,7 @@ public final class AppRuntimeCoordinator {
         // Start in the compact listening pill — don't auto-pop a full card at
         // meeting start. A real card flips it open (CoachOverlayController.update).
         coachOverlay?.minimizeToPill()
+        coachOverlay?.setListening(true)
         coachOverlay?.present(projectName: projectName)
         coachSubscriptionTask?.cancel()
         // Capture the active meeting's project so the listener scopes retrieval
@@ -2321,6 +2344,7 @@ public final class AppRuntimeCoordinator {
         coachSubscriptionTask = nil
         if let listener = coachListener { Task { await listener.endMeeting() } }
         activeMeetingProjectID = nil
+        coachOverlay?.setListening(false)
         coachOverlay?.update(activeCard: nil)
         coachOverlay?.hide()
     }
@@ -2334,13 +2358,13 @@ public final class AppRuntimeCoordinator {
         case .surfaced(let card):
             overlay.update(activeCard: card)
             overlay.appendRecentTrigger(
-                RecentTrigger(label: card.title, kind: card.kind, wasSurfaced: true)
+                RecentTrigger(label: card.title, kind: card.kind, wasSurfaced: true, card: card)
             )
         case .withheld(let card, let reason):
             Loggers.bridges.info(
                 "Coach card \(reason.logDescription, privacy: .public) (\(reason.rawValue, privacy: .public)): \(card.title, privacy: .public)")
             overlay.appendRecentTrigger(
-                RecentTrigger(label: card.title, kind: card.kind, wasSurfaced: false)
+                RecentTrigger(label: card.title, kind: card.kind, wasSurfaced: false, card: card)
             )
         }
     }
@@ -2996,9 +3020,33 @@ public final class AppRuntimeCoordinator {
         guard !projectRecords.isEmpty else { return }
         let candidates = projectRecords.map { ProjectCandidate(id: $0.id, name: $0.name) }
         let saved = await repo.loadSavedMeeting(latest)
+        // Sample utterances ACROSS the whole meeting, not just the opening
+        // minutes: the start is small talk and the worst ASR stretch (warm-up,
+        // language lock-on), and classifying off it alone once filed a Spanish
+        // lesson into "Romanian classes".
+        let utterances = saved.utterances
+        let sampleStride = max(1, utterances.count / 60)
         let transcriptPrefix = String(
-            saved.utterances.prefix(60).map(\.text).joined(separator: " ").prefix(2000)
+            stride(from: 0, to: utterances.count, by: sampleStride)
+                .map { utterances[$0].text }
+                .joined(separator: " ")
+                .prefix(2000)
         )
+        // The generated meeting title (title generation runs before this) is the
+        // single strongest classification signal; skip the date-stamp fallback
+        // shape, which carries no content.
+        let meetingTitle = latest.title.flatMap { Self.isPlaceholderMeetingTitle($0) ? nil : $0 }
+        // A few titles already filed in each project show the classifier what
+        // kind of meeting lives there ("Spanish classes" ← other Spanish lessons).
+        var recentTitlesByProject: [UUID: [String]] = [:]
+        for meeting in environment.state.meetingLibrary.meetings {
+            guard meeting.sessionId != targetSessionId,
+                let projectId = meeting.projectId, let uuid = UUID(uuidString: projectId),
+                let title = meeting.title, !title.isEmpty, !Self.isPlaceholderMeetingTitle(title),
+                recentTitlesByProject[uuid, default: []].count < 3
+            else { continue }
+            recentTitlesByProject[uuid, default: []].append(title)
+        }
 
         // Best-effort calendar context near the meeting's start: attendees feed the
         // attendee signal, the event title helps the LLM classifier. Degrades to
@@ -3024,7 +3072,8 @@ public final class AppRuntimeCoordinator {
         )
         guard
             let result = try? await categorizer.categorize(
-                input, projects: candidates, calendarTitle: calendarTitle
+                input, projects: candidates, calendarTitle: calendarTitle,
+                meetingTitle: meetingTitle, recentTitlesByProject: recentTitlesByProject
             )
         else { return }
 
@@ -3090,7 +3139,10 @@ public final class AppRuntimeCoordinator {
     }
 
     /// Build the meeting-detail banner from a categorization result (BAS-9): the
-    /// auto-filed confirmation, or the top candidates to choose from.
+    /// auto-filed confirmation, or the top candidates to choose from. Carries
+    /// EVERY project (alphabetical) alongside the top-3 chips so the banner's
+    /// picker can always reach the right project — a misfiled meeting must
+    /// never leave its true project unreachable.
     private static func categorizationSuggestion(
         from result: CategorizationResult, autoFiled: Bool
     ) -> MeetingCategorizationSuggestion {
@@ -3099,6 +3151,13 @@ public final class AppRuntimeCoordinator {
                 id: $0.project.id.uuidString, name: $0.project.name, confidence: $0.confidence
             )
         }
+        let allProjects = result.scores
+            .map {
+                MeetingCategorizationSuggestion.Candidate(
+                    id: $0.project.id.uuidString, name: $0.project.name, confidence: $0.confidence
+                )
+            }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         let headline: String
         if autoFiled, let top = candidates.first {
             headline = "Filed in \(top.name) · AI \(Int((top.confidence * 100).rounded()))%"
@@ -3106,8 +3165,18 @@ public final class AppRuntimeCoordinator {
             headline = "Suggested project"
         }
         return MeetingCategorizationSuggestion(
-            headline: headline, candidates: Array(candidates), isAutoFiled: autoFiled
+            headline: headline, candidates: Array(candidates), allProjects: allProjects,
+            isAutoFiled: autoFiled
         )
+    }
+
+    /// True for the date-stamp fallback title ("Meeting 2026-06-11 12:03") a
+    /// session gets before/without AI title generation — carries no content
+    /// worth feeding the project classifier.
+    private static func isPlaceholderMeetingTitle(_ title: String) -> Bool {
+        title.range(
+            of: #"^Meeting \d{4}-\d{2}-\d{2} \d{2}:\d{2}$"#, options: .regularExpression
+        ) != nil
     }
 
     private func runTranscribeFile() {

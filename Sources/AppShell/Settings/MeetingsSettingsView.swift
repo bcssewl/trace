@@ -78,6 +78,15 @@ public struct MeetingsSettingsView: View {
                     .disabled(!state.meetingAutoDetectEnabled)
                 }
                 SettingsRow(
+                    key: "Notice calls in other apps",
+                    hint:
+                        "Spot calls even in apps Trace doesn’t recognise, from your microphone and speakers being busy together for a while. Takes a little longer to notice, and always asks before recording."
+                ) {
+                    Toggle("", isOn: $state.meetingDetectUnlistedApps)
+                        .labelsHidden()
+                        .disabled(!state.meetingAutoDetectEnabled)
+                }
+                SettingsRow(
                     key: "Summarize as you go",
                     hint:
                         "Build up decisions, open questions, and action items during the meeting. You’ll get the full write-up at the end either way.",

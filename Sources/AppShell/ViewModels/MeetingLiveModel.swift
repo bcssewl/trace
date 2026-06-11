@@ -32,11 +32,19 @@ public struct MeetingCategorizationSuggestion: Sendable, Hashable {
     }
     public let headline: String
     public let candidates: [Candidate]
+    /// Every project, alphabetical — backs the banner's "all projects" picker,
+    /// so a misfiled meeting can always be moved to the right project even when
+    /// it didn't make the top-3 chips.
+    public let allProjects: [Candidate]
     public let isAutoFiled: Bool
 
-    public init(headline: String, candidates: [Candidate], isAutoFiled: Bool) {
+    public init(
+        headline: String, candidates: [Candidate], allProjects: [Candidate] = [],
+        isAutoFiled: Bool
+    ) {
         self.headline = headline
         self.candidates = candidates
+        self.allProjects = allProjects
         self.isAutoFiled = isAutoFiled
     }
 }

@@ -121,11 +121,25 @@ final class MeetingSignalSourcesTests: XCTestCase {
             result: BrowserTabSignal(
                 browserBundleID: "com.google.Chrome",
                 url: "https://meet.google.com/xyz"))
-        let source = LiveMeetingSignalSource(browserReader: stub)
+        // Pin the mic probe live: the browserTab signal is mic-gated (a real
+        // call always opens the input device), and the real CoreAudio probe
+        // would make this test depend on the machine's actual mic state.
+        let source = LiveMeetingSignalSource(browserReader: stub, micActiveProbe: { true })
         let signals = await source.currentSignals()
         // The stub always returns a meeting URL regardless of frontmost app, so
         // the browserTab signal must be present.
         XCTAssertTrue(signals.contains(.browserTab))
+    }
+
+    func testLiveSourceWithMicIdleSuppressesBrowserTab() async {
+        let stub = StubBrowserReader(
+            result: BrowserTabSignal(
+                browserBundleID: "com.google.Chrome",
+                url: "https://meet.google.com/xyz"))
+        // Mic idle → a meeting tab merely being open must NOT read as a call.
+        let source = LiveMeetingSignalSource(browserReader: stub, micActiveProbe: { false })
+        let signals = await source.currentSignals()
+        XCTAssertFalse(signals.contains(.browserTab))
     }
 
     func testLiveSourceWithNilBrowserReaderHasNoBrowserTab() async {
