@@ -38,7 +38,8 @@ final class SettingsTabTests: XCTestCase {
         // Consolidated from 16 → 12: Dictionary, Audio Devices, Calendar,
         // Accessibility/Paste and Watched Folders were merged away (Calendar +
         // Watched Folders + Accessibility now live under a single Integrations tab).
-        XCTAssertEqual(tabs.count, 12)
+        // 13 with the dedicated Permissions panel (every macOS permission + status).
+        XCTAssertEqual(tabs.count, 13)
         let sections = Set(tabs.map(\.section))
         XCTAssertEqual(sections, ["General", "Voice", "Intelligence", "Integrations", "About"])
     }

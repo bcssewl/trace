@@ -4,6 +4,7 @@ import SwiftUI
 public enum SettingsTab: String, Sendable, Hashable, CaseIterable, Identifiable {
     case appearance
     case libraryStorage
+    case permissions
     case updates
     case modesAndPrompts
     case hotkeys
@@ -19,7 +20,7 @@ public enum SettingsTab: String, Sendable, Hashable, CaseIterable, Identifiable 
 
     public var section: String {
         switch self {
-        case .appearance, .libraryStorage, .updates: return "General"
+        case .appearance, .libraryStorage, .permissions, .updates: return "General"
         case .modesAndPrompts, .hotkeys, .dictationModels, .meetings:
             return "Voice"
         case .llmRouter, .coachTriggers:
@@ -43,6 +44,7 @@ public enum SettingsTab: String, Sendable, Hashable, CaseIterable, Identifiable 
         switch self {
         case .appearance: return "Appearance"
         case .libraryStorage: return "Library & storage"
+        case .permissions: return "Permissions"
         case .updates: return "Updates"
         case .modesAndPrompts: return "Modes & prompts"
         case .hotkeys: return "Keyboard shortcuts"
@@ -61,6 +63,7 @@ public enum SettingsTab: String, Sendable, Hashable, CaseIterable, Identifiable 
         switch self {
         case .appearance: return "paintbrush"
         case .libraryStorage: return "externaldrive"
+        case .permissions: return "lock.shield"
         case .updates: return "arrow.down.circle"
         case .modesAndPrompts: return "text.bubble"
         case .hotkeys: return "command"
@@ -263,6 +266,8 @@ public struct SettingsDetailPane: View {
         switch tab {
         case .appearance: return "Choose how Trace looks — light or dark, and how spacious things feel."
         case .libraryStorage: return "See where your recordings and notes are kept, and how much space they can use."
+        case .permissions:
+            return "Every macOS permission Trace can use, with its live status. Grant what you want here any time."
         case .updates: return "Decide how Trace keeps itself up to date."
         case .modesAndPrompts: return "Set up rules that change how your dictation is tidied up, app by app."
         case .hotkeys: return "Pick the keyboard shortcuts that start and stop Trace."
@@ -291,6 +296,7 @@ public struct SettingsDetailPane: View {
         case .dictationModels:
             ASREnginesSettingsView(state: appState)
         case .libraryStorage: LibraryStorageSettingsView(state: appState)
+        case .permissions: PermissionsCenterView()
         case .updates: UpdatesSettingsView(state: appState)
         case .modesAndPrompts: DictationModesSettingsView()
         case .hotkeys: HotkeysSettingsView(state: appState)

@@ -130,17 +130,33 @@ public struct PermissionRequester: Sendable {
     }
 
     private func requestSystemAudio() async -> PermissionStatus {
+        let status = await systemAudioLiveStatus()
+        if status == .denied {
+            await MainActor.run { self.openSystemSettings(for: .systemAudio) }
+        }
+        return status
+    }
+
+    /// Live, authoritative check of the "Screen & System Audio Recording" grant
+    /// for THIS running binary — by creating and immediately destroying a global
+    /// process tap and reading the result. `.granted` (noErr) vs `.denied`
+    /// (illegal-operation); an undecided grant makes macOS show its TCC prompt
+    /// here, which is exactly what we want at launch and at meeting start: ask
+    /// BEFORE recording, never discover a dead tap 15 s into a one-sided call.
+    ///
+    /// Unlike `LiveSystemAudioPermission` (which reads a cached UserDefaults
+    /// value that goes stale the moment macOS revokes a grant — e.g. when the
+    /// app's signature changes or a second copy holds the real grant), this asks
+    /// CoreAudio directly. It always rewrites the cache to the live truth, so the
+    /// snapshot/settings stop lying. Does NOT open System Settings — the caller
+    /// decides how to surface a denial (a meeting-start notice, a launch banner).
+    public func systemAudioLiveStatus() async -> PermissionStatus {
         guard #available(macOS 14.4, *) else { return .restricted }
-        Loggers.bootstrap.info("PermissionRequester.requestSystemAudio: probing AudioHardwareCreateProcessTap")
-        // Probe by creating a process tap on our own PID. macOS will prompt
-        // the user with the audio-capture TCC dialog the first time. On
-        // subsequent attempts macOS returns the cached decision without prompting.
+        Loggers.bootstrap.info("PermissionRequester.systemAudioLiveStatus: probing AudioHardwareCreateProcessTap")
         let status = await Task.detached(priority: .userInitiated) { () -> PermissionStatus in
-            // Use a GLOBAL tap (exclude no processes = capture everything). This is
-            // what triggers macOS to register the app under "System Audio Recording
-            // Only" in System Settings → Privacy & Security → Screen & System Audio
-            // Recording. A self-tap (processes: [selfPID]) does NOT register because
-            // macOS doesn't consider self-capture a privileged operation.
+            // GLOBAL tap (exclude no processes = capture everything) — the mode
+            // that registers the app under "System Audio Recording Only" and is
+            // gated by the real grant. A self-tap is unprivileged and wouldn't test it.
             let desc = CATapDescription(monoGlobalTapButExcludeProcesses: [])
             desc.uuid = UUID()
             desc.name = "Trace Permission Probe"
@@ -151,23 +167,20 @@ public struct PermissionRequester: Sendable {
             let result = AudioHardwareCreateProcessTap(desc, &tapID)
             if result == noErr, tapID != kAudioObjectUnknown {
                 _ = AudioHardwareDestroyProcessTap(tapID)
-                Loggers.bootstrap.info("PermissionRequester.requestSystemAudio: global probe tap succeeded; granted")
+                Loggers.bootstrap.info("PermissionRequester.systemAudioLiveStatus: probe tap succeeded; granted")
                 return .granted
             }
             if result == kAudioHardwareIllegalOperationError {
                 Loggers.bootstrap.warning(
-                    "PermissionRequester.requestSystemAudio: kAudioHardwareIllegalOperationError; denied or notDetermined"
+                    "PermissionRequester.systemAudioLiveStatus: kAudioHardwareIllegalOperationError; denied/notDetermined"
                 )
                 return .denied
             }
             Loggers.bootstrap.error(
-                "PermissionRequester.requestSystemAudio: probe failed status=\(result, privacy: .public)")
+                "PermissionRequester.systemAudioLiveStatus: probe failed status=\(result, privacy: .public)")
             return .denied
         }.value
         UserDefaults.standard.set(status.rawValue, forKey: systemAudioCacheKey)
-        if status == .denied {
-            await MainActor.run { self.openSystemSettings(for: .systemAudio) }
-        }
         return status
     }
 

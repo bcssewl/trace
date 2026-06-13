@@ -212,6 +212,21 @@ public final class OnboardingStateModel {
         permissionState[kind] = result
     }
 
+    /// Whether an "ask for everything" pass is in flight (drives the button label).
+    public var requestingAll = false
+
+    /// Request every permission in turn — the onboarding "Enable all" button.
+    /// Sequential so the macOS dialogs queue cleanly instead of racing, and so a
+    /// first-run user grants everything up front rather than meeting prompts
+    /// scattered across later feature use.
+    public func requestAllPermissions() async {
+        requestingAll = true
+        for kind in PermissionRequester.Kind.allCases {
+            await requestPermission(kind)
+        }
+        requestingAll = false
+    }
+
     public func openPermissionSettings(_ kind: PermissionRequester.Kind) {
         requester.openSystemSettings(for: kind)
     }

@@ -331,6 +331,21 @@ struct OnboardingPermissionsView: View {
             .padding(.vertical, 16)
             .frame(maxWidth: 640, alignment: .leading)
 
+            // One tap asks macOS for everything in turn, so a first-run user grants
+            // it all up front instead of being surprised by prompts later, mid-task.
+            HStack(spacing: 10) {
+                BrutalistButton(
+                    state.requestingAll ? "Asking…" : "Enable all", kind: .primary, systemImage: "checkmark.shield"
+                ) {
+                    Task { await state.requestAllPermissions() }
+                }
+                .disabled(state.requestingAll)
+                Text("or turn on just the ones you want below")
+                    .font(BrutalistTypography.caption)
+                    .foregroundStyle(palette.fgMuted.color)
+            }
+            .padding(.bottom, 4)
+
             group("Core — needed to dictate", core)
             group("For meetings", meetings)
             group("Optional", optional)

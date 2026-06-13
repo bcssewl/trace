@@ -578,6 +578,50 @@ public final class AppRuntimeCoordinator {
         restartWatchedFolders()
         // Apply per-project model/ASR route overrides to the freshly built routers.
         await hydrateProjectOverrides()
+        // Verify permissions on launch (not lazily per-feature): ask for the
+        // undecided ones up front and surface anything missing. Spawned, not
+        // awaited, so a permission prompt never delays the window appearing.
+        Task { [weak self] in await self?.verifyLaunchPermissions() }
+    }
+
+    /// On launch, the app should KNOW whether it has the permissions its core
+    /// features need — never discover a missing grant the moment you try to use
+    /// one. For an already-onboarded user (first run is handled by the onboarding
+    /// permissions step) this asks for the undecided core permissions up front and
+    /// raises one actionable banner for anything still missing.
+    ///
+    /// System audio is probed LIVE — its cached status goes stale the instant
+    /// macOS revokes the grant (a signature change, a second app copy holding the
+    /// real grant), which is exactly the trap that recorded whole meetings
+    /// one-sided while Settings still claimed "granted".
+    private func verifyLaunchPermissions() async {
+        guard AppStateModel.persistedOnboardingComplete() else { return }
+        let requester = PermissionRequester()
+        let snap = await PermissionGate().snapshot()
+
+        // Microphone: ask now if the user hasn't decided (the up-front ask). A
+        // prior denial is left alone — macOS won't re-prompt; the banner links out.
+        var micStatus = snap.microphone
+        if micStatus == .notDetermined { micStatus = await requester.request(.microphone) }
+        // System audio: live probe — prompts only when undecided, silent otherwise,
+        // and rewrites the stale cache to the truth either way.
+        let systemAudioStatus = await requester.systemAudioLiveStatus()
+
+        var missing: [String] = []
+        if micStatus != .granted { missing.append("Microphone") }
+        if systemAudioStatus != .granted { missing.append("System Audio Recording") }
+        if snap.accessibility != .granted { missing.append("Accessibility") }
+        guard !missing.isEmpty else { return }
+
+        let list = ListFormatter.localizedString(byJoining: missing)
+        environment.notices.post(
+            severity: .warning,
+            title: "Trace is missing permissions",
+            message:
+                "Trace doesn't have: \(list). Meetings, dictation, or typing-in-place won't fully work until you grant these. Review them in Settings → Permissions.",
+            actions: [.openSettingsTab(.permissions, label: "Open Settings → Permissions")],
+            coalescingKey: "permissions.launch"
+        )
     }
 
     /// Load every project's persisted overrides and apply them to the routers
@@ -2889,6 +2933,31 @@ public final class AppRuntimeCoordinator {
         let epoch = meetingSessionEpoch
         Task { [weak self] in
             guard let self else { return }
+            // PRE-FLIGHT permissions BEFORE committing to a meeting: ask for what's
+            // needed up front so a missing grant is known NOW, not discovered 15s
+            // into a one-sided recording.
+            let requester = PermissionRequester()
+            // Microphone is mandatory — nothing records without it. Prompts if
+            // undecided; opens Settings if previously denied.
+            let micStatus = await requester.request(.microphone)
+            guard micStatus == .granted else {
+                self.environment.state.activeCapture.end()
+                self.notchHUD?.hide()
+                self.environment.notices.post(
+                    severity: .error,
+                    title: "Microphone access needed",
+                    message:
+                        "Trace can't record a meeting without microphone access. Grant it in Settings → Permissions, then start the meeting again.",
+                    actions: [.openSettingsTab(.permissions, label: "Open Settings → Permissions")],
+                    coalescingKey: "meeting.start"
+                )
+                return
+            }
+            // System audio = the OTHER people on the call. Probe the live grant up
+            // front: prompts if undecided, so the user grants BEFORE recording
+            // rather than finding out the call was one-sided afterwards.
+            let othersWillBeRecorded = await requester.systemAudioLiveStatus() == .granted
+
             guard let runtime = await self.ensureMeetingRuntime() else {
                 // Bootstrap failed (no database) — without this banner the HUD
                 // just never appears and the user is left guessing.
@@ -2911,6 +2980,24 @@ public final class AppRuntimeCoordinator {
                     projectId: projectContext
                 )
                 self.notchHUD?.showCompact(timer: "0:00", kind: .meeting)
+                // System audio wasn't granted at pre-flight → tell the user the
+                // call is being recorded one-sided RIGHT NOW, not 15s later. The
+                // recording still runs (they may want a mic-only capture); the
+                // in-meeting deaf-tap watchdog self-heals the transcript notice if
+                // audio does start flowing.
+                if !othersWillBeRecorded {
+                    self.environment.state.meetingLive.setCaptureNotice(
+                        "Only recording you — Trace doesn't have System Audio Recording yet. Turn it on in System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording, then restart the meeting."
+                    )
+                    self.environment.notices.post(
+                        severity: .warning,
+                        title: "Recording only you",
+                        message:
+                            "Trace can't hear the other people on this call — it doesn't have System Audio Recording yet. Grant it in Settings → Permissions, then restart the meeting.",
+                        actions: [.openSettingsTab(.permissions, label: "Open Settings → Permissions")],
+                        coalescingKey: "meeting.systemAudio"
+                    )
+                }
                 self.activeMeetingProjectID = projectContext
                 let coachConfig = await self.effectiveCoachConfig(projectID: projectContext)
                 // If the meeting was stopped (or another start fired) while this one
