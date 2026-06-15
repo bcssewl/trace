@@ -190,6 +190,7 @@ public enum NotchKind: Sendable, Hashable {
     case micUnavailable  // mic permission missing / device gone — start failed
     case modelMissing  // speech model not on disk — start failed
     case secureField  // focused element is a password field — insert refused
+    case confirmCancel  // first Esc of a double-press — awaiting the second to cancel
     case cancelled  // user cancelled the recording (Esc) — nothing inserted
     case stillFinishing  // new start queued behind the previous cycle's tail
     case recoveryAvailable(Int)  // crashed-session dictations await recovery
@@ -200,7 +201,9 @@ public enum NotchKind: Sendable, Hashable {
     /// the model-working kinds breathe; the session-resolving kinds drain.
     public var phase: NotchPhase {
         switch self {
-        case .listening, .meeting, .voiceMemo:
+        case .listening, .meeting, .voiceMemo, .confirmCancel:
+            // confirmCancel is still actively recording — keep the hump live so
+            // the user sees the dictation is intact, just awaiting a second Esc.
             return .listening
         case .preparing, .downloading, .transcribing, .cleaning, .stillFinishing:
             return .transcribing
@@ -234,6 +237,7 @@ public enum NotchKind: Sendable, Hashable {
         case .micUnavailable: return "Microphone unavailable"
         case .modelMissing: return "Model not downloaded — open Settings"
         case .secureField: return "Secure field — text not inserted"
+        case .confirmCancel: return "Press Esc again to cancel"
         case .cancelled: return "Cancelled"
         case .stillFinishing: return "Still finishing the previous dictation"
         case .recoveryAvailable(let count):

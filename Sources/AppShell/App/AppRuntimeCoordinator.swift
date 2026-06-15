@@ -69,6 +69,13 @@ public final class AppRuntimeCoordinator {
     /// (audio + crash-spool discarded) instead of letting it reach the focused
     /// app where it could close a dialog.
     private var escapeCancelInterceptor: EscapeKeyInterceptor?
+    /// Double-press cancel: the first bare Esc arms this and shows the "press Esc
+    /// again to cancel" hint; a second Esc within `escapeCancelWindow` confirms.
+    /// A lone stray Esc just disarms when the window lapses — it no longer wipes a
+    /// long dictation, which was the whole complaint.
+    private var escapeCancelArmed = false
+    private var escapeArmResetTask: Task<Void, Never>?
+    private static let escapeCancelWindow: TimeInterval = 2.0
     /// True while the current lone-modifier press is the one that *started*
     /// dictation — so its release can decide tap (keep recording) vs hold (stop).
     private var dictationTriggerStartedRecording = false
@@ -2737,7 +2744,7 @@ public final class AppRuntimeCoordinator {
     private func installEscapeCancelInterceptor() {
         teardownEscapeCancelInterceptor()
         let interceptor = EscapeKeyInterceptor { [weak self] in
-            self?.runCancelDictation()
+            self?.handleEscapeWhileDictating()
         }
         switch interceptor.start() {
         case .started:
@@ -2750,8 +2757,44 @@ public final class AppRuntimeCoordinator {
     }
 
     private func teardownEscapeCancelInterceptor() {
+        // Clear the double-press arm + its pending HUD-restore task on every
+        // teardown (re-arm, normal stop, cancel), so a stray armed state can't
+        // carry into the next dictation or clobber the post-stop HUD.
+        escapeArmResetTask?.cancel()
+        escapeArmResetTask = nil
+        escapeCancelArmed = false
         escapeCancelInterceptor?.stop()
         escapeCancelInterceptor = nil
+    }
+
+    /// Bare Esc while dictating. First press ARMS the cancel and shows "Press Esc
+    /// again to cancel" for a short window; a second press within it confirms and
+    /// discards the recording. A single stray Esc no longer wipes the dictation —
+    /// it just disarms when the window lapses and recording carries on.
+    private func handleEscapeWhileDictating() {
+        guard environment.state.activeCapture.mode == .dictation else { return }
+        if escapeCancelArmed {
+            escapeArmResetTask?.cancel()
+            escapeArmResetTask = nil
+            escapeCancelArmed = false
+            runCancelDictation()
+            return
+        }
+        escapeCancelArmed = true
+        notchHUD?.setKind(.confirmCancel)
+        escapeArmResetTask?.cancel()
+        escapeArmResetTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.escapeCancelWindow * 1_000_000_000))
+            guard let self, !Task.isCancelled else { return }
+            self.escapeCancelArmed = false
+            self.escapeArmResetTask = nil
+            // Forgive the stray Esc: if still recording, restore the normal
+            // dictating chrome. If dictation already ended, leave the HUD as the
+            // stop/cancel path set it.
+            if self.environment.state.activeCapture.mode == .dictation {
+                self.notchHUD?.setKind(.listening)
+            }
+        }
     }
 
     /// Esc pressed while dictating: bin the recording. Controller-side this

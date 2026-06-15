@@ -33,18 +33,25 @@ public final class EnterKeyInterceptor {
     /// Which bare keypresses this tap swallows (Return/Enter by default; the
     /// Escape variant uses kVK_Escape).
     private let interceptKeyCodes: Set<Int64>
+    /// One-shot taps disarm after the first interception (Return-to-send fires
+    /// once, then the caller tears the tap down). A continuous tap stays armed
+    /// and reports every bare press — needed by Esc-to-cancel, which must see the
+    /// *second* Escape of a double-press to confirm the cancel.
+    private let oneShot: Bool
 
     /// - Parameter onReturn: invoked (on the main actor, out-of-band from the
     ///   tap callback) when a plain Return is intercepted.
     public init(onReturn: @escaping @MainActor () -> Void) {
         self.onReturn = onReturn
         self.interceptKeyCodes = Self.returnKeyCodes
+        self.oneShot = true
     }
 
     /// Same machinery, different key — used by `EscapeKeyInterceptor`.
-    init(keyCodes: Set<Int64>, onIntercept: @escaping @MainActor () -> Void) {
+    init(keyCodes: Set<Int64>, oneShot: Bool = true, onIntercept: @escaping @MainActor () -> Void) {
         self.onReturn = onIntercept
         self.interceptKeyCodes = keyCodes
+        self.oneShot = oneShot
     }
 
     @discardableResult
@@ -119,21 +126,31 @@ public final class EnterKeyInterceptor {
             guard event.flags.intersection(modifiers).isEmpty else {
                 return Unmanaged.passUnretained(event)
             }
+            // Ignore OS key-repeat from a held key: a held Escape must not fire
+            // twice and self-confirm a double-press cancel. Swallow the repeat
+            // (so it doesn't reach the focused app) without reporting it — unless
+            // Trace itself is active, where we leave the key alone entirely.
+            if event.getIntegerValueField(.keyboardEventAutorepeat) != 0 {
+                let traceActive = MainActor.assumeIsolated { NSApplication.shared.isActive }
+                return traceActive ? Unmanaged.passUnretained(event) : nil
+            }
             let intercepted = MainActor.assumeIsolated { () -> Bool in
-                // Don't hijack Return inside our OWN UI — if Trace is the active
+                // Don't hijack the key inside our OWN UI — if Trace is the active
                 // app the user is typing into Trace (a search box, a field), not
-                // dictating into someone else's app, so leave their Return be.
+                // dictating into someone else's app, so leave their key be.
                 if NSApplication.shared.isActive { return false }
-                // Disarm immediately (safe from within the callback) so a second
-                // Return in the same instant can't double-fire, then hand off on
-                // the next main-loop turn — invalidating the port from inside its
-                // own callback is not safe, so we never do the teardown here.
-                if let tap = self.tap { CGEvent.tapEnable(tap: tap, enable: false) }
+                // One-shot taps disarm immediately (safe from within the callback)
+                // so a second press in the same instant can't double-fire; the
+                // caller then tears the tap down on the next main-loop turn.
+                // A continuous tap stays armed so it can catch the second press of
+                // a double-press — the caller debounces. Invalidating the port from
+                // inside its own callback is unsafe, so we only ever disable here.
+                if self.oneShot, let tap = self.tap { CGEvent.tapEnable(tap: tap, enable: false) }
                 let callback = self.onReturn
                 DispatchQueue.main.async { MainActor.assumeIsolated { callback() } }
                 return true
             }
-            // Swallow the Return only when we acted on it — otherwise pass it on.
+            // Swallow the key only when we acted on it — otherwise pass it on.
             return intercepted ? nil : Unmanaged.passUnretained(event)
 
         default:
@@ -159,9 +176,11 @@ public final class EscapeKeyInterceptor {
     private let inner: EnterKeyInterceptor
 
     /// - Parameter onEscape: invoked (on the main actor, out-of-band from the
-    ///   tap callback) when a plain Escape is intercepted.
+    ///   tap callback) on each bare Escape press. Continuous (not one-shot): the
+    ///   tap stays armed so the caller can require a *second* Escape to confirm
+    ///   the cancel, rather than wiping a long dictation on a single stray tap.
     public init(onEscape: @escaping @MainActor () -> Void) {
-        self.inner = EnterKeyInterceptor(keyCodes: [Self.escapeKeyCode], onIntercept: onEscape)
+        self.inner = EnterKeyInterceptor(keyCodes: [Self.escapeKeyCode], oneShot: false, onIntercept: onEscape)
     }
 
     @discardableResult
