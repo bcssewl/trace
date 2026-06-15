@@ -597,10 +597,11 @@ public final class AppRuntimeCoordinator {
     /// permissions step) this asks for the undecided core permissions up front and
     /// raises one actionable banner for anything still missing.
     ///
-    /// System audio is probed LIVE — its cached status goes stale the instant
-    /// macOS revokes the grant (a signature change, a second app copy holding the
-    /// real grant), which is exactly the trap that recorded whole meetings
-    /// one-sided while Settings still claimed "granted".
+    /// System audio is read from the cached snapshot here, NOT probed live: a live
+    /// probe creates a system-audio process tap, and creating one near capture
+    /// leaves the real meeting tap deaf. We never create a probe tap automatically
+    /// — only the explicit "Grant" action (a deliberate, capture-free moment) and
+    /// the real capture itself create taps.
     private func verifyLaunchPermissions() async {
         guard AppStateModel.persistedOnboardingComplete() else { return }
         let requester = PermissionRequester()
@@ -610,13 +611,10 @@ public final class AppRuntimeCoordinator {
         // prior denial is left alone — macOS won't re-prompt; the banner links out.
         var micStatus = snap.microphone
         if micStatus == .notDetermined { micStatus = await requester.request(.microphone) }
-        // System audio: live probe — prompts only when undecided, silent otherwise,
-        // and rewrites the stale cache to the truth either way.
-        let systemAudioStatus = await requester.systemAudioLiveStatus()
 
         var missing: [String] = []
         if micStatus != .granted { missing.append("Microphone") }
-        if systemAudioStatus != .granted { missing.append("System Audio Recording") }
+        if snap.systemAudio != .granted { missing.append("System Audio Recording") }
         if snap.accessibility != .granted { missing.append("Accessibility") }
         guard !missing.isEmpty else { return }
 
@@ -2976,12 +2974,16 @@ public final class AppRuntimeCoordinator {
         let epoch = meetingSessionEpoch
         Task { [weak self] in
             guard let self else { return }
-            // PRE-FLIGHT permissions BEFORE committing to a meeting: ask for what's
-            // needed up front so a missing grant is known NOW, not discovered 15s
-            // into a one-sided recording.
+            // PRE-FLIGHT the MICROPHONE only — it's mandatory and AVCaptureDevice
+            // checks it without side effects. Do NOT probe system audio here: that
+            // probe creates a global process tap and tears it down, and macOS does
+            // NOT tolerate a second system-audio tap created immediately afterwards
+            // — the REAL capture tap comes up deaf (records only you). The real tap
+            // (SystemAudioCapture) triggers the macOS grant prompt itself on first
+            // use, and the in-meeting deaf-tap watchdog surfaces a genuinely missing
+            // grant. Creating a throwaway probe tap right before capture was a
+            // regression that broke system-audio capture on every meeting.
             let requester = PermissionRequester()
-            // Microphone is mandatory — nothing records without it. Prompts if
-            // undecided; opens Settings if previously denied.
             let micStatus = await requester.request(.microphone)
             guard micStatus == .granted else {
                 self.environment.state.activeCapture.end()
@@ -2996,10 +2998,6 @@ public final class AppRuntimeCoordinator {
                 )
                 return
             }
-            // System audio = the OTHER people on the call. Probe the live grant up
-            // front: prompts if undecided, so the user grants BEFORE recording
-            // rather than finding out the call was one-sided afterwards.
-            let othersWillBeRecorded = await requester.systemAudioLiveStatus() == .granted
 
             guard let runtime = await self.ensureMeetingRuntime() else {
                 // Bootstrap failed (no database) — without this banner the HUD
@@ -3023,24 +3021,10 @@ public final class AppRuntimeCoordinator {
                     projectId: projectContext
                 )
                 self.notchHUD?.showCompact(timer: "0:00", kind: .meeting)
-                // System audio wasn't granted at pre-flight → tell the user the
-                // call is being recorded one-sided RIGHT NOW, not 15s later. The
-                // recording still runs (they may want a mic-only capture); the
-                // in-meeting deaf-tap watchdog self-heals the transcript notice if
-                // audio does start flowing.
-                if !othersWillBeRecorded {
-                    self.environment.state.meetingLive.setCaptureNotice(
-                        "Only recording you — Trace doesn't have System Audio Recording yet. Turn it on in System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording, then restart the meeting."
-                    )
-                    self.environment.notices.post(
-                        severity: .warning,
-                        title: "Recording only you",
-                        message:
-                            "Trace can't hear the other people on this call — it doesn't have System Audio Recording yet. Grant it in Settings → Permissions, then restart the meeting.",
-                        actions: [.openSettingsTab(.permissions, label: "Open Settings → Permissions")],
-                        coalescingKey: "meeting.systemAudio"
-                    )
-                }
+                // Whether the other side is actually being captured is judged by the
+                // in-meeting deaf-tap watchdog (the real tap, observed for silence
+                // while audio plays) — never by a throwaway probe tap, which breaks
+                // the real capture.
                 self.activeMeetingProjectID = projectContext
                 let coachConfig = await self.effectiveCoachConfig(projectID: projectContext)
                 // If the meeting was stopped (or another start fired) while this one

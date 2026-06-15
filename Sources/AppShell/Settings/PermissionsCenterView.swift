@@ -109,12 +109,12 @@ public struct PermissionsCenterView: View {
             section("For meetings", .meetings)
             section("Optional", .optional)
         }
-        // Live system-audio probe on first open (honest, unlike the cached value);
-        // a lighter snapshot when the window simply regains focus after a trip to
-        // System Settings, so re-focusing never re-pops a prompt.
-        .task { await refresh(live: true) }
+        // Snapshot only — never auto-probe system audio here. A probe creates a
+        // process tap, and doing that can leave a subsequent meeting's real tap
+        // deaf; the explicit "Grant" button is the only place we create one.
+        .task { await refresh() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            Task { await refresh(live: false) }
+            Task { await refresh() }
         }
     }
 
@@ -168,9 +168,9 @@ public struct PermissionsCenterView: View {
         busy = false
     }
 
-    private func refresh(live: Bool) async {
+    private func refresh() async {
         let snap = await gate.snapshot()
-        var next: [PermissionRequester.Kind: PermissionStatus] = [
+        statuses = [
             .microphone: snap.microphone,
             .accessibility: snap.accessibility,
             .systemAudio: snap.systemAudio,
@@ -179,13 +179,5 @@ public struct PermissionsCenterView: View {
             .calendar: snap.calendar,
             .notifications: snap.notifications,
         ]
-        // The snapshot reads system-audio from a cache that goes stale the moment
-        // macOS revokes the grant. On first open, replace it with a live probe so
-        // the panel tells the truth (this prompts only if the grant is still
-        // undecided — exactly when asking is right).
-        if live {
-            next[.systemAudio] = await requester.systemAudioLiveStatus()
-        }
-        statuses = next
     }
 }
