@@ -184,6 +184,34 @@ public final class MeetingLiveModel {
     /// recording. nil = system audio is being captured (or nothing's wrong yet).
     public private(set) var captureNotice: String?
 
+    /// How the user can fix a one-sided recording, chosen by the runtime from the
+    /// last-known grant: the permission is simply OFF (open Settings to enable it)
+    /// vs. it reads granted but isn't taking effect — a *stale* grant after a
+    /// signature change — which needs a reset + re-grant because "turn it on" is
+    /// useless when it already looks on. nil = no actionable fix button (the
+    /// notice is informational, e.g. a transient "recovering audio" pill).
+    public enum CaptureFix: Sendable, Equatable {
+        case openSettings
+        case resetGrant
+
+        public var actionTitle: String {
+            switch self {
+            case .openSettings: return "Open Settings"
+            case .resetGrant: return "Reset & re-grant"
+            }
+        }
+    }
+
+    /// The fix offered by the current `captureNotice`, if any. Drives whether the
+    /// banner shows an action button (Open Settings / Reset & re-grant) instead of
+    /// a plain Dismiss.
+    public private(set) var captureNoticeFix: CaptureFix?
+
+    /// Set by the runtime so the capture-notice banner's button can open the right
+    /// Settings pane or reset a stale system-audio grant — without the view ever
+    /// touching TCC or knowing the bundle id.
+    @ObservationIgnored public var performCaptureFix: (@MainActor (CaptureFix) async -> Void)?
+
     /// Per-session speaker rename map (`speakerID` → display name).
     public private(set) var speakerNames: [String: String] = [:]
 
@@ -272,6 +300,7 @@ public final class MeetingLiveModel {
         health = .capturing
         engineNotice = nil
         captureNotice = nil
+        captureNoticeFix = nil
         storageNotices = []
         scrollTargetTime = nil
         regenerateSummary = nil
@@ -404,9 +433,12 @@ public final class MeetingLiveModel {
     }
 
     /// The notice is rendered verbatim as a status pill, so it MUST be plain,
-    /// human-facing sentence-case text. nil clears the pill.
-    public func setCaptureNotice(_ notice: String?) {
+    /// human-facing sentence-case text. nil clears the pill. `fix` adds an action
+    /// button to the banner (Open Settings / Reset & re-grant); it is ignored when
+    /// `notice` is nil.
+    public func setCaptureNotice(_ notice: String?, fix: CaptureFix? = nil) {
         self.captureNotice = notice
+        self.captureNoticeFix = notice == nil ? nil : fix
     }
 
     /// Rename a speaker for this session.

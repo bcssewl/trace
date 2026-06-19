@@ -53,12 +53,21 @@ struct MeetingLiveView: View {
         if !model.storageNotices.isEmpty || model.captureNotice != nil {
             VStack(spacing: BrutalistMetrics.space1) {
                 if let capture = model.captureNotice {
-                    BrutalistBanner(
-                        kind: .warning,
-                        title: capture,
-                        actionTitle: "Dismiss",
-                        action: { model.setCaptureNotice(nil) }
-                    )
+                    if let fix = model.captureNoticeFix {
+                        BrutalistBanner(
+                            kind: .warning,
+                            title: capture,
+                            actionTitle: fix.actionTitle,
+                            action: { Task { await model.performCaptureFix?(fix) } }
+                        )
+                    } else {
+                        BrutalistBanner(
+                            kind: .warning,
+                            title: capture,
+                            actionTitle: "Dismiss",
+                            action: { model.setCaptureNotice(nil) }
+                        )
+                    }
                 }
                 ForEach(model.storageNotices, id: \.self) { notice in
                     BrutalistBanner(

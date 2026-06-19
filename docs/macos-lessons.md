@@ -35,6 +35,15 @@ the updater silently refuses to update.
   mints a fresh identity per build and wipes TCC grants every rebuild. A named
   self-signed cert (the same one each build) keeps grants across rebuilds. Bake it
   into the project config so you never re-sign by hand.
+- **Local builds and CI releases must share ONE certificate, not just one *name*.**
+  Two self-signed certs both called "Trace Local Signing" (one generated per-machine
+  by `setup-local-signing.sh`, one in the CI `LOCAL_SIGNING_CERT_P12` secret) have
+  different leaf hashes, so macOS treats them as different apps: grant the local
+  build, install the CI DMG, and the system-audio grant is dead while the toggle
+  still reads ON → meetings record only you. Export the local cert once
+  (`scripts/export-local-signing-cert.sh` → `gh secret set LOCAL_SIGNING_CERT_P12`)
+  and adopt it on other machines with `setup-local-signing.sh --from-p12`. Verify
+  with `codesign -d -r- <app>` — the `certificate leaf = H"…"` must match everywhere.
 - **To fix a tangled grant:** `tccutil reset ScreenCapture <bundleid>` (also
   `Microphone`, `Accessibility`, …), then relaunch and re-grant. Toggling the
   Settings switch is not enough once a grant is bound to a dead identity.
@@ -66,13 +75,23 @@ the updater silently refuses to update.
 
 - **Some permissions have NO read-only status API** (Screen & System Audio
   Recording is the big one). You can only learn the status by *attempting the
-  operation*. So probe live, and never persist a "granted" result as truth — it
-  goes stale the instant the OS revokes it.
+  operation*. Never persist a "granted" result as truth — it goes stale the
+  instant the OS revokes it.
+- **DON'T "probe" system-audio by creating a throwaway tap near capture — it
+  leaves the real capture tap DEAF.** This is the trap: to check the grant you'd
+  create a global process tap, destroy it, then start the real one. macOS does not
+  tolerate a second system-audio tap created right after another — the real tap
+  comes up producing only silence, so every recording is one-sided. There is no
+  safe way to pre-check this permission. Treat the **real capture tap as the only
+  tap**: let it trigger the macOS prompt itself on first use, and detect a
+  genuinely missing grant by a watchdog that flags *silence while the default
+  output is actively playing* (the only way to tell "deaf tap" from "quiet call").
+  (We shipped exactly this regression: a pre-flight probe broke capture on every
+  meeting; the fix was to delete the probe.)
 - **Tap-creation success is NOT proof of working capture.** The system-audio tap
   (`AudioHardwareCreateProcessTap` / `CATapDescription`, macOS 14.4+; use a *global*
   tap to register under "Screen & System Audio Recording") can create successfully
-  yet deliver only digital silence when the grant isn't effective. Confirm by
-  observing real (non-zero) audio.
+  yet deliver only digital silence. Confirm by observing real (non-zero) audio.
 - **Ask for everything up front** in onboarding (offer an "Enable all"), not the
   first time each feature is used. Lazy per-feature prompts hide missing grants
   until mid-task.

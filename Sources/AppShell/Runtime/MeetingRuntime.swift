@@ -371,6 +371,12 @@ public final class MeetingRuntime {
             }
         }
 
+        // Let the one-sided-capture banner's button act (open Settings / reset a
+        // stale grant) without the view touching TCC.
+        liveModel.performCaptureFix = { [weak self] fix in
+            await self?.handleCaptureFix(fix)
+        }
+
         // Watchdog for the "authorized but deaf" system-audio case: poll on a
         // cadence and warn (once) if the tap is alive yet has only ever produced
         // silence while the Mac is actively playing audio out. Always runs — this
@@ -503,12 +509,46 @@ public final class MeetingRuntime {
             SystemAudioCapture.isDefaultOutputActive()
         else { return }
         systemAudioWarned = true
-        liveModel.setCaptureNotice(
-            "Only recording you — turn on System Audio Recording for Trace in System Settings ▸ Privacy & Security ▸ Screen & System Audio Recording, then restart the meeting."
-        )
+        // Off vs stale: if the last-known grant reads granted yet the tap is deaf,
+        // the permission has gone stale (it still shows enabled but no longer
+        // authorises capture after a signature change) — telling the user to "turn
+        // it on" is useless because it already looks on. Offer a reset instead.
+        // Otherwise the grant is genuinely off → point them at Settings to enable it.
+        let cached = await LiveSystemAudioPermission().systemAudioStatus()
+        let stale = cached == .granted
+        if stale {
+            liveModel.setCaptureNotice(
+                "Only recording you — Trace's system-audio permission has gone stale (it still shows enabled but stopped working, which happens after an app update or a signing change). Reset it, then stop and restart the meeting to re-grant.",
+                fix: .resetGrant)
+        } else {
+            liveModel.setCaptureNotice(
+                "Only recording you — turn on System Audio Recording for Trace under Screen & System Audio Recording, then stop and restart the meeting.",
+                fix: .openSettings)
+        }
         Loggers.meeting.error(
-            "System audio appears unauthorized or stalled: frames=\(diag.framesObserved, privacy: .public), only silence captured while the default output is active — recording mic only. Surfaced capture notice → Screen & System Audio Recording."
+            "System audio \(stale ? "grant stale (cached=granted but deaf)" : "off/undetermined", privacy: .public): frames=\(diag.framesObserved, privacy: .public), only silence captured while the default output is active — recording mic only. Surfaced capture notice → Screen & System Audio Recording."
         )
+    }
+
+    /// Perform the fix offered by the one-sided ("only recording you") capture
+    /// notice, invoked from its banner button. `.openSettings` deep-links to the
+    /// Screen & System Audio Recording pane; `.resetGrant` clears the stale TCC
+    /// entry for our own bundle so the next real tap re-prompts, then opens the
+    /// pane and updates the notice to say what to do next.
+    private func handleCaptureFix(_ fix: MeetingLiveModel.CaptureFix) async {
+        let requester = PermissionRequester()
+        switch fix {
+        case .openSettings:
+            requester.openSystemSettings(for: .systemAudio)
+        case .resetGrant:
+            let ok = await requester.resetSystemAudioGrant()
+            requester.openSystemSettings(for: .systemAudio)
+            liveModel.setCaptureNotice(
+                ok
+                    ? "Permission reset. If Trace still appears under Screen & System Audio Recording, remove it — then stop and restart the meeting to re-grant."
+                    : "Couldn't reset automatically. Remove Trace from Screen & System Audio Recording yourself, then stop and restart the meeting.",
+                fix: .openSettings)
+        }
     }
 
     /// Called when the user picks "keep recording" on the call-ended prompt:

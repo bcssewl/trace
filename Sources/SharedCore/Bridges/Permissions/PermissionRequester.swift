@@ -184,6 +184,23 @@ public struct PermissionRequester: Sendable {
         return status
     }
 
+    /// Clears the "Screen & System Audio Recording" TCC grant for THIS bundle so
+    /// macOS re-prompts the next time the real capture tap is created. This is the
+    /// recovery for a *stale* grant — one that still shows enabled in System
+    /// Settings but no longer authorises capture because the running binary's code
+    /// signature no longer matches the one the grant was created against (after an
+    /// update, or switching between a locally-built and a CI-built copy that share
+    /// the bundle id but not the signing cert). "Turn it on" is useless there — it
+    /// already looks on — so we wipe the entry and let the next real tap re-prompt.
+    /// Also clears the cached snapshot so it stops reporting the dead grant as
+    /// granted. Returns whether `tccutil` exited cleanly.
+    @discardableResult
+    public func resetSystemAudioGrant() async -> Bool {
+        let ok = await Self.runTccReset(service: "ScreenCapture")
+        UserDefaults.standard.removeObject(forKey: systemAudioCacheKey)
+        return ok
+    }
+
     private func requestAccessibility() async -> PermissionStatus {
         // Check status silently first — no prompt yet.
         if AXIsProcessTrusted() { return .granted }
