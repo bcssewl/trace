@@ -65,6 +65,10 @@ public final class AppRuntimeCoordinator {
     /// from an await (model download, runtime build) with a stale generation
     /// aborts — the user already said stop.
     private var dictationStartGeneration: UInt64 = 0
+    /// Handle to the in-flight dictation STOP/teardown so a rapid restart can
+    /// await it before arming, instead of racing the controller epoch (which made
+    /// the new cycle silently cancel itself). Mirrors `MeetingRuntime`'s teardownTask.
+    private var dictationStopTask: Task<Void, Never>?
     /// Swallows a bare Esc while dictation records, turning it into a cancel
     /// (audio + crash-spool discarded) instead of letting it reach the focused
     /// app where it could close a dialog.
@@ -2491,6 +2495,15 @@ public final class AppRuntimeCoordinator {
                 self.notchHUD?.state.startedAt = Date()
                 self.notchHUD?.setKind(.listening)
             }
+            // Wait for the previous dictation's teardown to finish before arming.
+            // A rapid stop→start otherwise races the controller epoch and the new
+            // cycle silently cancels itself (cancelledBeforeStart) — the "it didn't
+            // start until I waited a couple seconds" bug. Show "still finishing" so
+            // the wait is honest; awaiting an already-finished stop is instant.
+            if let pendingStop = self.dictationStopTask {
+                self.notchHUD?.setKind(.stillFinishing)
+                await pendingStop.value
+            }
             // If the previous cycle's tail is still finishing, startCapture
             // CHAINS (event-driven, starts the instant the tail completes) —
             // be honest in the HUD while that happens.
@@ -2584,6 +2597,7 @@ public final class AppRuntimeCoordinator {
         // Kill any start still preparing (model download / runtime build) —
         // without this, stop-before-ready left a zombie capture with no HUD.
         dictationStartGeneration &+= 1
+        let stopGeneration = dictationStartGeneration
         environment.state.activeCapture.end()
         // Update just the label — keep the same startedAt so the elapsed
         // timer counts from when the user first hit ⌥Space instead of
@@ -2595,16 +2609,17 @@ public final class AppRuntimeCoordinator {
             && environment.state.dictationASREngine.supportsStreaming
         notchHUD?.setKind(streamedLive ? .cleaning : .transcribing)
         Loggers.dictation.info("AppCommands.stopDictation invoked")
-        Task { [weak self] in
+        let task = Task { [weak self] in
             guard let self else { return }
             guard let runtime = self.dictationRuntime else {
-                self.notchHUD?.hide()
+                self.hideDictationHUD(ifGeneration: stopGeneration)
                 return
             }
             // Invalidate any startCapture still arming (controller epoch), so a
             // stop that lands mid-arming cancels that pending cycle rather than
             // letting it reach .recording with no HUD.
             _ = await runtime.controller.invalidatePendingStarts()
+            var keepHUDVisible = false
             do {
                 let result = try await runtime.controller.stopCapture()
                 if let result {
@@ -2629,7 +2644,7 @@ public final class AppRuntimeCoordinator {
                             await self.submitReturnAfterInsert()
                         }
                     }
-                    try? await Task.sleep(nanoseconds: 1_400_000_000)
+                    keepHUDVisible = true
                 } else {
                     // stopCapture was a no-op: nothing was recording. If a cycle
                     // is still ARMING (stop raced the start), cancel it so it
@@ -2661,9 +2676,36 @@ public final class AppRuntimeCoordinator {
                         coalescingKey: "dictation.stop"
                     )
                 }
+                keepHUDVisible = true
+            }
+            // Teardown is complete — this stored handle resolves NOW, so a rapid
+            // restart can arm the instant the previous cycle is actually done,
+            // not after the cosmetic result-pill delay. Wind the HUD down
+            // separately and gated, so it never blanks a dictation the user has
+            // already restarted.
+            self.scheduleDictationHUDHide(keepVisible: keepHUDVisible, ifGeneration: stopGeneration)
+        }
+        dictationStopTask = task
+    }
+
+    /// Hide the dictation HUD unless a newer dictation has begun since
+    /// `generation` — a restart bumps `dictationStartGeneration` and owns the HUD,
+    /// so an earlier stop's wind-down must not blank it.
+    private func hideDictationHUD(ifGeneration generation: UInt64) {
+        guard dictationStartGeneration == generation else { return }
+        notchHUD?.hide()
+    }
+
+    /// Keep the post-stop result pill visible briefly, then hide — without
+    /// blocking a restart or blanking one. The stop's awaitable handle has already
+    /// resolved, so this delay runs detached; the hide is gated on the generation
+    /// so pressing the hotkey again during the delay keeps the new dictation's HUD.
+    private func scheduleDictationHUDHide(keepVisible: Bool, ifGeneration generation: UInt64) {
+        Task { [weak self] in
+            if keepVisible {
                 try? await Task.sleep(nanoseconds: 1_400_000_000)
             }
-            self.notchHUD?.hide()
+            self?.hideDictationHUD(ifGeneration: generation)
         }
     }
 

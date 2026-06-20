@@ -149,6 +149,11 @@ public final class AppleSpeechStreamingTranscriber: StreamingTranscriber, @unche
     // error) so `finish()` can release it without hanging.
     private var taskFinished = false
     private var teardownContinuation: CheckedContinuation<Void, Never>?
+    /// The "no terminal callback arrived" safety timeout armed by `finish()`.
+    /// Stored so a clean finish (`signalFinished`) can cancel it — otherwise it
+    /// lingers ~1.5 s and can force-tear-down the NEXT dictation's cycle on this
+    /// shared instance, clipping it to an empty result.
+    private var safetyTimeoutTask: Task<Void, Never>?
 
     public init() {}
 
@@ -233,11 +238,14 @@ public final class AppleSpeechStreamingTranscriber: StreamingTranscriber, @unche
                 c.resume()
             } else {
                 // Safety: never block finalize forever if no terminal callback
-                // arrives from the recognizer.
-                Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                // arrives from the recognizer. Stored + cancelled on a clean
+                // finish so it can't fire into the NEXT dictation's cycle.
+                let timeout = Task { [weak self] in
+                    do { try await Task.sleep(nanoseconds: 1_500_000_000) }
+                    catch { return }  // cancelled by a clean finish — don't tear down
                     self?.forceTeardown()
                 }
+                lock.withLock { safetyTimeoutTask = timeout }
             }
         }
         return lock.withLock {
@@ -253,6 +261,10 @@ public final class AppleSpeechStreamingTranscriber: StreamingTranscriber, @unche
     private func signalFinished() {
         let cont = lock.withLock { () -> CheckedContinuation<Void, Never>? in
             taskFinished = true
+            // Clean finish: cancel the safety timeout so it can't fire into a
+            // later cycle on this shared instance.
+            safetyTimeoutTask?.cancel()
+            safetyTimeoutTask = nil
             let c = teardownContinuation
             teardownContinuation = nil
             return c
@@ -262,6 +274,7 @@ public final class AppleSpeechStreamingTranscriber: StreamingTranscriber, @unche
 
     private func forceTeardown() {
         let cont = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+            safetyTimeoutTask = nil
             let c = teardownContinuation
             teardownContinuation = nil
             return c
